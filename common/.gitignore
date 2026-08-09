@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+
+# Logs / temp
+*.log
+/tmp/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Local config overrides
+*.local.conf

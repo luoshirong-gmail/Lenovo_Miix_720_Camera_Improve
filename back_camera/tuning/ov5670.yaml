@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: CC0-1.0
+# ov5670 tuning — 2026-08-08 (方案 C 实验)
+# 基于 uncalibrated.yaml + 关键参数调整:
+#   Agc.relativeLuminanceTarget: 默认 0.16 (画面暗, 暗光不提亮)
+#     → 0.35 (提亮, 接近 Windows 级曝光; 目标 <0.95 不饱和限制内)
+# 其余算法保持默认; AWB 偏红待代码层实验 (awb.cpp 不读 tuning)
+%YAML 1.1
+---
+version: 1
+algorithms:
+  - Af:
+  - Agc:
+      relativeLuminanceTarget: 0.35
+  - Awb:
+  - BlackLevelCorrection:
+  - ToneMapping:
+...

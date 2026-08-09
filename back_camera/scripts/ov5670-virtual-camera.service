@@ -1,0 +1,21 @@
+[Unit]
+Description=OV5670 Back Camera virtual device (on-demand /dev/video16 forwarder, C' scheme)
+# 时序说明 (C' 方案 2026-08-07, 合并项目 2026-08-08):
+#  - ExecStartPre 确保 /dev/video16 存在 (开机自愈, 动态设备重启后消失)
+#  - ExecStartPost 刷新 wireplumber (video16 创建后修正节点枚举, 仅病态时重启)
+#  - bus 监听: pipeline ERROR → 退出 → Restart 自愈 (CAM6 流错误/video16 删除)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+# 开机自愈: 动态创建 video16 (幂等)
+ExecStartPre=%h/Projects/Lenovo_Miix_720_Camera_Improve/back_camera/scripts/ov5670-ensure-device.sh
+ExecStart=%h/Projects/Lenovo_Miix_720_Camera_Improve/back_camera/scripts/ov5670-router
+# video16 创建后刷新 wireplumber 节点枚举 (统一参数化脚本, 参数 16)
+ExecStartPost=%h/Projects/Lenovo_Miix_720_Camera_Improve/common/wireplumber-refresh.sh 16
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target

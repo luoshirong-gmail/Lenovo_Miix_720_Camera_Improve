@@ -1,0 +1,238 @@
+/*
+ * USB Camera Enhancement - Single-Pass GLSL ES 1.00 Fragment Shader
+ * =================================================================
+ * Runs on Intel HD 620 (Kaby Lake gen9) via GStreamer glshader.
+ * GL context is Wayland/EGL -> GLSL ES 1.00 (GLES 2.0):
+ *   - varying (not in/out), texture2D (not texture), gl_FragColor
+ *   - explicit precision qualifiers required
+ *   - no array constructors (forbidden in ES 1.00)
+ *
+ * Pipeline (all GPU, zero CPU compute):
+ *   MJPG dmabuf -> jpegdec(CPU) -> glupload -> glcolorconvert(RGBA)
+ *   -> THIS SHADER (renders 720p texture -> 1080p FBO, bicubic upscale)
+ *   -> glcolorconvert(NV12) -> gldownload -> v4l2sink
+ *
+ * Stages:
+ *   0. Bicubic upscale (Catmull-Rom, 4x4 taps) — sharper than GL_LINEAR
+ *   1. Noise reduction   5x5 weighted blur
+ *   2. Sharpening        adaptive unsharp mask (edge-aware)
+ *   3. Color             contrast + saturation boost
+ *
+ * IN_WIDTH/IN_HEIGHT are substituted at runtime by scripts/make_shader.py.
+ * Tune the values below and restart the service.
+ */
+
+precision highp float;
+precision highp int;
+
+uniform sampler2D tex;
+varying vec2 v_texcoord;
+
+// Resolution (auto-set by pipeline, do not edit manually)
+const float IN_WIDTH   = 640.0;
+const float IN_HEIGHT  = 480.0;
+
+// ========================================
+// Tunable parameters - edit these values:
+// ========================================
+
+const float UPSCALE     = 1.0;   // 1.0 = bicubic 720p→1080p 放大; 0.0 = 只增强不放大(720p 原生输出)
+const float DENOISE     = 1.5;   // Blur factor for noise reduction   [0.0 .. 2.0]  (提高: 降噪更强)
+const float SHARPEN     = 2.0;   // Unsharp mask strength             [0.0 .. 3.0]
+const float CONTRAST    = 1.12;  // Contrast multiplier               [1.0 .. 1.5]  (低: 避免压暗暗部)
+const float SATURATION  = 1.35;  // Color saturation boost            [1.0 .. 2.0]  (提高: 色彩更鲜活)
+const float GAMMA       = 0.82;  // Gamma 提亮: <1.0 提亮暗部, >1.0 压暗   [0.7 .. 1.3]  (降低: 更亮)
+
+// ========================================
+// Bicubic (Catmull-Rom) interpolation — sharper upscale than GL_LINEAR.
+// 4x4 neighborhood, weights from the Catmull-Rom cubic kernel.
+// ========================================
+
+float cubic_weight(float t) {
+    // Catmull-Rom kernel (a = -0.5)
+    // |t| <= 1: 1.5*t^3 - 2.5*t^2 + 1
+    // 1 < |t| < 2: -0.5*t^3 + 2.5*t^2 - 4*t + 2
+    float at = abs(t);
+    if (at <= 1.0) {
+        return (1.5 * at - 2.5) * at * at + 1.0;
+    } else if (at < 2.0) {
+        return ((-0.5 * at + 2.5) * at - 4.0) * at + 2.0;
+    }
+    return 0.0;
+}
+
+vec3 sample_bicubic(vec2 uv) {
+    // Map uv (0..1) to texel coordinates in the source texture
+    vec2 texel = uv * vec2(IN_WIDTH, IN_HEIGHT) - 0.5;
+    vec2 base = floor(texel);
+    vec2 frac = texel - base;
+
+    vec3 result = vec3(0.0);
+    float total = 0.0;
+
+    // 4x4 neighborhood (unrolled, no array constructors in ES 1.00)
+    // Row -1
+    float wx = cubic_weight(frac.x + 1.0); float wy = cubic_weight(frac.y + 1.0);
+    result += texture2D(tex, (base + vec2(-1.0,-1.0) + 0.5) / vec2(IN_WIDTH, IN_HEIGHT)).rgb * (wx * wy); total += wx * wy;
+    wx = cubic_weight(frac.x); wy = cubic_weight(frac.y + 1.0);
+    result += texture2D(tex, (base + vec2( 0.0,-1.0) + 0.5) / vec2(IN_WIDTH, IN_HEIGHT)).rgb * (wx * wy); total += wx * wy;
+    wx = cubic_weight(frac.x - 1.0); wy = cubic_weight(frac.y + 1.0);
+    result += texture2D(tex, (base + vec2( 1.0,-1.0) + 0.5) / vec2(IN_WIDTH, IN_HEIGHT)).rgb * (wx * wy); total += wx * wy;
+    wx = cubic_weight(frac.x - 2.0); wy = cubic_weight(frac.y + 1.0);
+    result += texture2D(tex, (base + vec2( 2.0,-1.0) + 0.5) / vec2(IN_WIDTH, IN_HEIGHT)).rgb * (wx * wy); total += wx * wy;
+
+    // Row 0
+    wx = cubic_weight(frac.x + 1.0); wy = cubic_weight(frac.y);
+    result += texture2D(tex, (base + vec2(-1.0, 0.0) + 0.5) / vec2(IN_WIDTH, IN_HEIGHT)).rgb * (wx * wy); total += wx * wy;
+    wx = cubic_weight(frac.x); wy = cubic_weight(frac.y);
+    result += texture2D(tex, (base + vec2( 0.0, 0.0) + 0.5) / vec2(IN_WIDTH, IN_HEIGHT)).rgb * (wx * wy); total += wx * wy;
+    wx = cubic_weight(frac.x - 1.0); wy = cubic_weight(frac.y);
+    result += texture2D(tex, (base + vec2( 1.0, 0.0) + 0.5) / vec2(IN_WIDTH, IN_HEIGHT)).rgb * (wx * wy); total += wx * wy;
+    wx = cubic_weight(frac.x - 2.0); wy = cubic_weight(frac.y);
+    result += texture2D(tex, (base + vec2( 2.0, 0.0) + 0.5) / vec2(IN_WIDTH, IN_HEIGHT)).rgb * (wx * wy); total += wx * wy;
+
+    // Row 1
+    wx = cubic_weight(frac.x + 1.0); wy = cubic_weight(frac.y - 1.0);
+    result += texture2D(tex, (base + vec2(-1.0, 1.0) + 0.5) / vec2(IN_WIDTH, IN_HEIGHT)).rgb * (wx * wy); total += wx * wy;
+    wx = cubic_weight(frac.x); wy = cubic_weight(frac.y - 1.0);
+    result += texture2D(tex, (base + vec2( 0.0, 1.0) + 0.5) / vec2(IN_WIDTH, IN_HEIGHT)).rgb * (wx * wy); total += wx * wy;
+    wx = cubic_weight(frac.x - 1.0); wy = cubic_weight(frac.y - 1.0);
+    result += texture2D(tex, (base + vec2( 1.0, 1.0) + 0.5) / vec2(IN_WIDTH, IN_HEIGHT)).rgb * (wx * wy); total += wx * wy;
+    wx = cubic_weight(frac.x - 2.0); wy = cubic_weight(frac.y - 1.0);
+    result += texture2D(tex, (base + vec2( 2.0, 1.0) + 0.5) / vec2(IN_WIDTH, IN_HEIGHT)).rgb * (wx * wy); total += wx * wy;
+
+    // Row 2
+    wx = cubic_weight(frac.x + 1.0); wy = cubic_weight(frac.y - 2.0);
+    result += texture2D(tex, (base + vec2(-1.0, 2.0) + 0.5) / vec2(IN_WIDTH, IN_HEIGHT)).rgb * (wx * wy); total += wx * wy;
+    wx = cubic_weight(frac.x); wy = cubic_weight(frac.y - 2.0);
+    result += texture2D(tex, (base + vec2( 0.0, 2.0) + 0.5) / vec2(IN_WIDTH, IN_HEIGHT)).rgb * (wx * wy); total += wx * wy;
+    wx = cubic_weight(frac.x - 1.0); wy = cubic_weight(frac.y - 2.0);
+    result += texture2D(tex, (base + vec2( 1.0, 2.0) + 0.5) / vec2(IN_WIDTH, IN_HEIGHT)).rgb * (wx * wy); total += wx * wy;
+    wx = cubic_weight(frac.x - 2.0); wy = cubic_weight(frac.y - 2.0);
+    result += texture2D(tex, (base + vec2( 2.0, 2.0) + 0.5) / vec2(IN_WIDTH, IN_HEIGHT)).rgb * (wx * wy); total += wx * wy;
+
+    return result / total;
+}
+
+// ========================================
+
+void main() {
+    vec2 uv = v_texcoord;
+    vec2 px = vec2(1.0 / IN_WIDTH, 1.0 / IN_HEIGHT);
+
+    // --- STAGE 0: Bicubic upscale (optional) ---
+    // UPSCALE=1: 720p→1080p 用 Catmull-Rom 4x4 放大（比 GL_LINEAR 锐利）
+    // UPSCALE=0: 不放大，直接采样源纹理（720p 原生输出，只做增强）
+    vec3 upscaled;
+    if (UPSCALE > 0.5) {
+        upscaled = sample_bicubic(uv);
+    } else {
+        upscaled = texture2D(tex, uv).rgb;
+    }
+
+    // --- STAGE 1: Noise reduction (5x5 weighted Gaussian-like blur) ---
+    float dstr = clamp(DENOISE, 0.0, 2.0);
+    vec3 color;
+
+    if (dstr < 0.1) {
+        color = upscaled;
+    } else {
+        // Gaussian-ish 5x5 weights (center boosted by denoise strength)
+        // Indexed manually (no array constructors in ES 1.00)
+        float w00 = 1.0; float w01 = 2.0; float w02 = 4.0; float w03 = 2.0; float w04 = 1.0;
+        float w10 = 2.0; float w11 = 4.0; float w12 = 8.0; float w13 = 4.0; float w14 = 2.0;
+        float w20 = 4.0; float w21 = 8.0; float w22 = 16.0 * (dstr * 0.5 + 0.5); float w23 = 8.0; float w24 = 4.0;
+        float w30 = 2.0; float w31 = 4.0; float w32 = 8.0; float w33 = 4.0; float w34 = 2.0;
+        float w40 = 1.0; float w41 = 2.0; float w42 = 4.0; float w43 = 2.0; float w44 = 1.0;
+
+        float total = w00 + w01 + w02 + w03 + w04
+                    + w10 + w11 + w12 + w13 + w14
+                    + w20 + w21 + w22 + w23 + w24
+                    + w30 + w31 + w32 + w33 + w34
+                    + w40 + w41 + w42 + w43 + w44;
+
+        color = vec3(0.0);
+        color += texture2D(tex, uv + vec2(-2.0,-2.0)*px).rgb * w00;
+        color += texture2D(tex, uv + vec2(-1.0,-2.0)*px).rgb * w01;
+        color += texture2D(tex, uv + vec2( 0.0,-2.0)*px).rgb * w02;
+        color += texture2D(tex, uv + vec2( 1.0,-2.0)*px).rgb * w03;
+        color += texture2D(tex, uv + vec2( 2.0,-2.0)*px).rgb * w04;
+        color += texture2D(tex, uv + vec2(-2.0,-1.0)*px).rgb * w10;
+        color += texture2D(tex, uv + vec2(-1.0,-1.0)*px).rgb * w11;
+        color += texture2D(tex, uv + vec2( 0.0,-1.0)*px).rgb * w12;
+        color += texture2D(tex, uv + vec2( 1.0,-1.0)*px).rgb * w13;
+        color += texture2D(tex, uv + vec2( 2.0,-1.0)*px).rgb * w14;
+        color += texture2D(tex, uv + vec2(-2.0, 0.0)*px).rgb * w20;
+        color += texture2D(tex, uv + vec2(-1.0, 0.0)*px).rgb * w21;
+        color += texture2D(tex, uv + vec2( 0.0, 0.0)*px).rgb * w22;
+        color += texture2D(tex, uv + vec2( 1.0, 0.0)*px).rgb * w23;
+        color += texture2D(tex, uv + vec2( 2.0, 0.0)*px).rgb * w24;
+        color += texture2D(tex, uv + vec2(-2.0, 1.0)*px).rgb * w30;
+        color += texture2D(tex, uv + vec2(-1.0, 1.0)*px).rgb * w31;
+        color += texture2D(tex, uv + vec2( 0.0, 1.0)*px).rgb * w32;
+        color += texture2D(tex, uv + vec2( 1.0, 1.0)*px).rgb * w33;
+        color += texture2D(tex, uv + vec2( 2.0, 1.0)*px).rgb * w34;
+        color += texture2D(tex, uv + vec2(-2.0, 2.0)*px).rgb * w40;
+        color += texture2D(tex, uv + vec2(-1.0, 2.0)*px).rgb * w41;
+        color += texture2D(tex, uv + vec2( 0.0, 2.0)*px).rgb * w42;
+        color += texture2D(tex, uv + vec2( 1.0, 2.0)*px).rgb * w43;
+        color += texture2D(tex, uv + vec2( 2.0, 2.0)*px).rgb * w44;
+
+        color /= total;
+    }
+
+    // --- STAGE 2: Adaptive unsharp mask sharpening ---
+    // (Sharpens the upscaled image; tuned slightly higher to compensate
+    // residual softening after bicubic.)
+    float sharp = clamp(SHARPEN, 0.0, 3.0);
+    if (sharp > 0.0) {
+        vec3 center = texture2D(tex, uv).rgb;
+
+        // 8-directional neighbors (diagonals scaled by 1/sqrt(2))
+        vec3 top    = texture2D(tex, uv + vec2( 0.0,-1.0)*px).rgb;
+        vec3 bottom = texture2D(tex, uv + vec2( 0.0, 1.0)*px).rgb;
+        vec3 left   = texture2D(tex, uv + vec2(-1.0, 0.0)*px).rgb;
+        vec3 right  = texture2D(tex, uv + vec2( 1.0, 0.0)*px).rgb;
+        vec3 tl     = texture2D(tex, uv + vec2(-1.0,-1.0)*px).rgb * 0.707;
+        vec3 tr     = texture2D(tex, uv + vec2( 1.0,-1.0)*px).rgb * 0.707;
+        vec3 bl     = texture2D(tex, uv + vec2(-1.0, 1.0)*px).rgb * 0.707;
+        vec3 br     = texture2D(tex, uv + vec2( 1.0, 1.0)*px).rgb * 0.707;
+
+        // Mean of 8-directional neighbors: orthogonals weight 1.0,
+        // diagonals scaled by 1/sqrt(2) for isotropic distance.
+        // Total weight = 4*1.0 + 4*0.7071 = 6.8284
+        vec3 adj_mean = (top + bottom + left + right
+                       + tl + tr + bl + br) / 6.8284;
+
+        // Unsharp: diff = center - mean, applied adaptively
+        vec3 diff = center - adj_mean;
+        float diff_luma = dot(abs(diff), vec3(0.299, 0.587, 0.114));
+
+        // Adaptive: reduce sharpening in smooth areas to avoid noise amplification
+        float adapt = clamp(diff_luma * 10.0, 0.0, 1.0);
+
+        color = color + sharp * diff * adapt;
+    }
+
+    // --- STAGE 3: Color enhancement (gamma brighten + contrast + saturation) ---
+
+    // Gamma 提亮: pow(color, GAMMA) with GAMMA<1.0 lifts shadows/midtones
+    // while keeping highlights near-clamped — friendlier to dark foreground
+    // subjects than a linear brightness offset (avoids washing out).
+    color = pow(color, vec3(GAMMA));
+
+    // Gentle contrast boost anchored slightly below midpoint so shadows
+    // are compressed less (avoids darkening the subject further).
+    float c = clamp(CONTRAST, 1.0, 1.5);
+    color = (color - 0.45) * c + 0.45;
+
+    // Saturation via luminance mixing
+    float luma = dot(color, vec3(0.299, 0.587, 0.114));
+    float s = clamp(SATURATION, 1.0, 2.0);
+    color = mix(vec3(luma), color, s);
+
+    // Final clamp to valid [0,1] range
+    color = clamp(color, 0.0, 1.0);
+
+    gl_FragColor = vec4(color, 1.0);
+}

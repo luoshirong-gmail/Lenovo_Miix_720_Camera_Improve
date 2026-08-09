@@ -1,0 +1,32 @@
+[Unit]
+Description=EnhancedCamera Router - integrated on-demand GPU enhancement (single C process, videotestsrc resident + dynamic enhance chain)
+# 时序关键: 必须在图形会话完全就绪后启动!
+#  - camera-router 需要 Wayland 显示服务器才能初始化 GL 上下文
+#  - 之前 WantedBy=default.target 在登录早期启动 → 无显示 → PLAYING failed
+#    → Restart=on-failure 无限重启循环 → 黑屏无法进桌面
+#  - graphical-session.target 在 Wayland 合成器就绪后激活 → GL 可用
+#    (合并自 autostart 方案: 原方案靠 GNOME autostart 延迟登录后启动;
+#     现统一用 graphical-session.target 时序, 更规范且单一启动源)
+After=graphical-session.target pipewire.service wireplumber.service
+PartOf=graphical-session.target
+Wants=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=%h/Projects/Lenovo_Miix_720_Camera_Improve/front_camera/pipeline/camera-router
+# writer 就绪后刷新 wireplumber 枚举 (登录时枚举过"无 writer"的 video99,
+# 节点缓存病态 → 应用协商失败; 重启重新枚举 → Node 格式正确)
+# (统一参数化脚本, 参数 99 = 前置增强虚拟设备)
+ExecStartPost=%h/Projects/Lenovo_Miix_720_Camera_Improve/common/wireplumber-refresh.sh 99
+Restart=on-failure
+RestartSec=5
+# GL context from graphical session (inherit user session env).
+# IMPORTANT: systemd user services started by default.target do NOT inherit
+# WAYLAND_DISPLAY/DISPLAY (session manager sets them after login) — without
+# these the pipeline refuses to start: "No display server detected".
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=WAYLAND_DISPLAY=wayland-0
+Environment=DISPLAY=:0
+
+[Install]
+WantedBy=graphical-session.target

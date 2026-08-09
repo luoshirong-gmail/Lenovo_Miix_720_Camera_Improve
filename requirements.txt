@@ -1,0 +1,15 @@
+# ============================================================
+# Lenovo Miix 720 Camera Improve — Python dependencies
+# ============================================================
+#
+# pip installable (docs/scripts/*.py 分析脚本):
+numpy
+pillow
+#
+# System packages (apt, NOT pip):
+#   python3-gi          → PyGObject (gi.repository.Gst)
+#   gir1.2-gstreamer-1.0 → GStreamer GI bindings
+#   gir1.2-glib-2.0     → GLib GI bindings
+#
+# camera-router.py 使用系统 Python (/usr/bin/python3)，自带 PyGObject。
+# docs/scripts/*.py 可在任意有 numpy+PIL 的环境中运行。

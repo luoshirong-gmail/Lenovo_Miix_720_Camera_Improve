@@ -1,0 +1,16 @@
+[Unit]
+Description=OV5670 AF controls self-heal (rebuild video16 if AF controls missing after boot)
+# 背景 (2026-08-09 第三次复发): 重启后 video16 对焦控件 (af_trigger/
+# focus_auto/focus_absolute) 偶发缺失 (0/3), ensure-device 的 add 注册
+# 未生效。此服务在后摄服务启动后检测: 控件缺失 → delete+add video16
+# 重建 (重新注册控件, 普通用户权限, 不影响 video99/前摄)。
+# 幂等: 控件正常时无操作。
+After=ov5670-virtual-camera.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/Projects/Lenovo_Miix_720_Camera_Improve/back_camera/scripts/ov5670-af-selfheal.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=graphical-session.target

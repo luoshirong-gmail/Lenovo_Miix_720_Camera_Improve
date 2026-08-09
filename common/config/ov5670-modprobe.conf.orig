@@ -1,0 +1,10 @@
+# OV5670 Virtual Camera - v4l2loopback module options
+# ⚠️ 2026-08-07: ov5670 项目自己的加载参数文件 (参考 usb-camera-enhancement.conf)
+# 目的: 保证重启后 v4l2loopback 加载参数正确 (exclusive_caps=0)。
+#   - ov5670 虚拟后摄 (video16) 依赖 exclusive_caps=0 (CAPTURE+OUTPUT,
+#     wireplumber 才能建 Video/Source 节点) + D-1 补丁 (ENUM_FMT 只 writer 格式)
+#   - 与 usb-camera-enhancement.conf 共享同一模块; 两文件 options 参数一致
+#     (字母序 ov5670 < usb, usb 后读覆盖, 一致则无冲突)。
+#   - video_nr/card_label 归 usb 项目 (video99), ov5670 的 video16 由
+#     v4l2loopback-ctl add 动态创建, 不在此配置。
+options v4l2loopback exclusive_caps=0 max_width=3840 max_height=2160 max_buffers=16

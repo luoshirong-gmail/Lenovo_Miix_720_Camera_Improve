@@ -1,0 +1,24 @@
+# 编译产物 (源码为准: gcc -O2 -Wall -o ov5670-router ov5670-router.c ...)
+scripts/ov5670-router
+scripts/min_sel_test
+scripts/min_sel_test2
+scripts/min_sel_test3
+
+# Logs / temp
+*.log
+/tmp/
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Systemd / runtime artifacts
+*.service.bak
+
+# Local config overrides
+*.local.conf

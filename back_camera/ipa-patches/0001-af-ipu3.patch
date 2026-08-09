@@ -1,0 +1,681 @@
+--- a/src/ipa/ipu3/algorithms/af.cpp
++++ b/src/ipa/ipu3/algorithms/af.cpp
+@@ -2,75 +2,88 @@
+ /*
+  * Copyright (C) 2021, Red Hat
+  *
+- * IPU3 auto focus algorithm
++ * IPU3 Af algorithm
++ *
++ * ⚠️ 2026-08-08 (全新重做, 基于原版 0.7.0 + 用户批准的设计):
++ *   三模式状态机 (manual/auto/continuous) + settle 帧计数补偿
++ *   (C1' 条件等待 / C2 方差平滑 / C3 峰值回步确认 / C4 细扫降速)
++ *
++ * 时序误差分析结论 (2026-08-08 论证):
++ *   - AF 统计与镜头实际位置存在固定管线延迟 (1帧) + VCM settle 延迟
++ *     (10-30ms), 帧率 29fps 硬件节拍 → 帧计数等待 = 时间等待, 抗 CPU 负载
++ *   - 负载只影响 process() 调度及时性 (决策顺延), 统计本身由硬件帧同步
++ *     保证正确 (DelayedControls 按 sequence 对齐)
+  */
+ 
+-#include "af.h"
+-
+-#include <algorithm>
+-#include <chrono>
+ #include <cmath>
+-#include <fcntl.h>
+-#include <sys/ioctl.h>
+-#include <sys/stat.h>
+-#include <sys/types.h>
+-#include <unistd.h>
+-
+-#include <linux/videodev2.h>
++#include <limits.h>
++#include <stdint.h>
+ 
+ #include <libcamera/base/log.h>
++#include <libcamera/base/utils.h>
+ 
+-#include <libcamera/ipa/core_ipa_interface.h>
++#include <libcamera/control_ids.h>
++#include <libcamera/controls.h>
++
++#include "af.h"
+ 
+ /**
+  * \file af.h
++ * \brief IPU3 AF control algorithm
+  */
+ 
+-/*
+- * Static variables from ChromiumOS Intel Camera HAL and ia_imaging library:
+- * - https://chromium.googlesource.com/chromiumos/platform/arc-camera/+/master/hal/intel/psl/ipu3/statsConverter/ipu3-stats.h
+- * - https://chromium.googlesource.com/chromiumos/platform/camera/+/refs/heads/main/hal/intel/ipu3/include/ia_imaging/af_public.h
+- */
++using namespace libcamera;
+ 
+-/** The minimum horizontal grid dimension. */
++using namespace std::literals::chrono_literals;
++
++namespace libcamera {
++
++namespace ipa::ipu3::algorithms {
++
++LOG_DEFINE_CATEGORY(IPU3Af)
++
++/* AF 统计网格硬件限制 (原版 0.7.0, configure 中使用) */
+ static constexpr uint8_t kAfMinGridWidth = 16;
+-/** The minimum vertical grid dimension. */
+ static constexpr uint8_t kAfMinGridHeight = 16;
+-/** The maximum horizontal grid dimension. */
+ static constexpr uint8_t kAfMaxGridWidth = 32;
+-/** The maximum vertical grid dimension. */
+ static constexpr uint8_t kAfMaxGridHeight = 24;
+-/** The minimum value of Log2 of the width of the grid cell. */
+ static constexpr uint16_t kAfMinGridBlockWidth = 4;
+-/** The minimum value of Log2 of the height of the grid cell. */
+ static constexpr uint16_t kAfMinGridBlockHeight = 3;
+-/** The maximum value of Log2 of the width of the grid cell. */
+ static constexpr uint16_t kAfMaxGridBlockWidth = 6;
+-/** The maximum value of Log2 of the height of the grid cell. */
+ static constexpr uint16_t kAfMaxGridBlockHeight = 6;
+-/** The number of blocks in vertical axis per slice. */
+ static constexpr uint16_t kAfDefaultHeightPerSlice = 2;
+ 
+-namespace libcamera {
+-
+-using namespace std::literals::chrono_literals;
+-
+-namespace ipa::ipu3::algorithms {
+-
+-LOG_DEFINE_CATEGORY(IPU3Af)
+-
+ /**
+  * Maximum focus steps of the VCM control
+  * \todo should be obtained from the VCM driver
+  */
+ static constexpr uint32_t kMaxFocusSteps = 1023;
+ 
+-/* Minimum focus step for searching appropriate focus */
+-static constexpr uint32_t kCoarseSearchStep = 30;
+-static constexpr uint32_t kFineSearchStep = 1;
+-
+-/* Max ratio of variance change, 0.0 < kMaxChange < 1.0 */
+-static constexpr double kMaxChange = 0.5;
++/*
++ * ⚠️ 2026-08-08 (v3 参数): 用户实测反馈"扫描慢" → 加速:
++ * kCoarseSearchStep 10→20 — 全范围扫描 ~4s→~2s (51 步 × 1帧 + settle)。
++ * 粗扫步进 20 → best 偏差 ±20, 细扫范围 ±51 (kFineRange 0.05) 仍覆盖。
++ * kFineSearchStep 1→2 — 细扫 102→51 步, ~10.6s→~5.3s (锁定 ±2 步精度,
++ * 峰值区域平滑, 采样间隔 2 不丢失峰值)。
++ */
++static constexpr uint32_t kCoarseSearchStep = 20;
++static constexpr uint32_t kFineSearchStep = 2;
++
++/* Max ratio of variance change, 0.0 < kMaxChange < 1.0
++ * ⚠️ v4 (2026-08-08): 0.3→0.4 — 0.3 实测误触发频繁 (正常场景方差
++ * 波动 20-40% 被误判失焦 → 对焦准确时反复重扫); 回调用户原始批准值
++ * 0.4 (比官方 0.5 敏感 20%, 真实失焦方差显著下降仍可靠触发) */
++static constexpr double kMaxChange = 0.4;
++
++/* ⚠️ 2026-08-08: 失焦连续确认帧数 — afIsOutOfFocus 连续 ≥5 帧超阈值
++ * (≈170ms) 才触发 afReset, 防单帧噪声/瞬时波动误判重扫 */
++static constexpr uint32_t kOutOfFocusConfirmFrames = 5;
++
++/* ⚠️ 2026-08-08: 扫描后基准收敛期帧数 — hill-climbing 扫描中方差快速
++ * 变化, EMA (0.5/0.5) 滞后导致扫描峰值被低估; 扫描完成 (stable) 后
++ * EMA 收敛到真实方差 → cur 显著 > max → 误判失焦反复重扫 (实测
++ * ratio 5.2)。收敛期内 maxVariance 跟随 EMA, 不判定失焦。 */
++static constexpr uint32_t kBaselineFrames = 10;
+ 
+ /* The numbers of frame to be ignored, before performing focus scan. */
+ static constexpr uint32_t kIgnoreFrame = 10;
+@@ -78,6 +91,26 @@
+ /* Fine scan range 0 < kFineRange < 1 */
+ static constexpr double kFineRange = 0.05;
+ 
++/* ⚠️ 2026-08-08 (settle 补偿, 用户批准 C1'/C4):
++ * 镜头移动后等待的帧数 (29fps → 1帧≈34.5ms, 覆盖 VCM settle 10-30ms)
++ *   - 粗扫单调上升段: 1 帧 (移动中方差趋势仍有效, 每步 2 帧 ≈ 7s)
++ *   - 峰值邻域/方向反转: 2 帧 (判定点, 必须等稳定)
++ *   - 细扫: 2 帧 (精度关键, 慢而稳)
++ * 用帧计数而非时间: 帧率硬件节拍固定 → 天然抗 CPU 负载抖动 */
++static constexpr uint32_t kSettleCoarseFrames = 1;
++static constexpr uint32_t kSettlePeakFrames = 2;
++static constexpr uint32_t kSettleFineFrames = 2;
++
++/* ⚠️ 2026-08-08: 峰值确认失败最大重扫次数 (防低对比度无限循环) */
++static constexpr uint32_t kMaxRescan = 2;
++
++/* ⚠️ 2026-08-08: auto idle 超时帧数 (AfTrigger 因 request 传递丢失时的兜底:
++ * auto 模式 idle 超过 ~700ms 且未收到 AfTrigger → 自动开始扫描) */
++static constexpr uint32_t kAutoIdleTimeoutFrames = 20;
++
++/* 方差滑动平均窗口 (C2, EMA 权重) */
++static constexpr double kVarEmaAlpha = 0.5; /* var = 0.5*new + 0.5*old (≈3帧等效) */
++
+ /* Settings for IPU3 AF filter */
+ static struct ipu3_uapi_af_filter_config afFilterConfigDefault = {
+ 	.y1_coeff_0 = { 0, 1, 3, 7 },
+@@ -106,7 +139,17 @@
+  */
+ Af::Af()
+ 	: focus_(0), bestFocus_(0), currentVariance_(0.0), previousVariance_(0.0),
+-	  coarseCompleted_(false), fineCompleted_(false)
++	  coarseCompleted_(false), fineCompleted_(false),
++	  afMode_(controls::AfModeContinuous), afTriggered_(false),
++	  lensPosition_(0.0f), locked_(false),
++	  forceScan_(false), forceScanStep_(0), forceBestVariance_(0.0),
++	  forceBestFocus_(0), fineScan_(false), fineScanStep_(0), fineScanRange_(0),
++	  fineScanStart_(0), fineBestVariance_(0.0), fineBestFocus_(0),
++  outOfFocusFrames_(0), baselineFrames_(0),
++	  confirmPeak_(false), confirmPeakFocus_(0), rescanCount_(0),
++	  autoIdleFrames_(0), bestFocusAll_(0), bestVarianceAll_(0.0),
++	  settleFrames_(0),
++	  smoothedVariance_(0.0)
+ {
+ }
+ 
+@@ -124,36 +167,10 @@
+ 	grid.block_width_log2 = kAfMinGridBlockWidth;
+ 	grid.block_height_log2 = kAfMinGridBlockHeight;
+ 
+-	/*
+-	 * \todo - while this clamping code is effectively a no-op, it satisfies
+-	 * the compiler that the constant definitions of the hardware limits
+-	 * are used, and paves the way to support dynamic grid sizing in the
+-	 * future. While the block_{width,height}_log2 remain assigned to the
+-	 * minimum, this code should be optimized out by the compiler.
+-	 */
+-	grid.width = std::clamp(grid.width, kAfMinGridWidth, kAfMaxGridWidth);
+-	grid.height = std::clamp(grid.height, kAfMinGridHeight, kAfMaxGridHeight);
+-
+-	grid.block_width_log2 = std::clamp(grid.block_width_log2,
+-					   kAfMinGridBlockWidth,
+-					   kAfMaxGridBlockWidth);
+-
+-	grid.block_height_log2 = std::clamp(grid.block_height_log2,
+-					    kAfMinGridBlockHeight,
+-					    kAfMaxGridBlockHeight);
+-
+-	grid.height_per_slice = kAfDefaultHeightPerSlice;
+-
+-	/* Position the AF grid in the center of the BDS output. */
++	/* AF 统计 ROI: 中心区域 (原版 0.7.0) */
+ 	Rectangle bds(configInfo.bdsOutputSize);
+ 	Size gridSize(grid.width << grid.block_width_log2,
+ 		      grid.height << grid.block_height_log2);
+-
+-	/*
+-	 * \todo - Support request metadata
+-	 * - Set the ROI based on any input controls in the request
+-	 * - Return the AF ROI as metadata in the Request
+-	 */
+ 	Rectangle roi = gridSize.centeredTo(bds.center());
+ 	Point start = roi.topLeft();
+ 
+@@ -238,6 +255,8 @@
+ 	if (afScan(context, kFineSearchStep)) {
+ 		context.activeState.af.stable = true;
+ 		fineCompleted_ = true;
++		/* ⚠️ 2026-08-08: 扫描完成 → 基准收敛期 (EMA 滞后防护) */
++		baselineFrames_ = kBaselineFrames;
+ 	}
+ }
+ 
+@@ -261,6 +280,14 @@
+ 	coarseCompleted_ = false;
+ 	fineCompleted_ = false;
+ 	maxStep_ = kMaxFocusSteps;
++	locked_ = false;
++	forceScan_ = false;
++	fineScan_ = false;
++	confirmPeak_ = false;
++	settleFrames_ = 0;
++	smoothedVariance_ = 0.0;
++	outOfFocusFrames_ = 0;
++	baselineFrames_ = 0;
+ }
+ 
+ /**
+@@ -370,7 +397,14 @@
+ 		var_sum += pow(avg - mean, 2);
+ 	}
+ 
+-	return var_sum / y_items.size();
++	/* ⚠️ 2026-08-08 (根治 continuous 误判重扫): 归一化方差 (var/mean²)
++	 * — AE 增益变化时 mean→g·mean, var→g²·var, var/mean² 不变 → 方差
++	 * 成为"曝光无关"的清晰度指标。实测 AE 漂移使绝对方差暴涨 6 倍
++	 * (cur=70万 vs max=11万, ratio 5.2) → afIsOutOfFocus 误判失焦反复
++	 * 重扫; 归一化后该漂移被消除。 */
++	if (mean > 1e-6)
++		return var_sum / y_items.size() / (mean * mean);
++	return var_sum / y_items.size(); /* 全黑保护 */
+ }
+ 
+ /**
+@@ -385,19 +419,298 @@
+  */
+ bool Af::afIsOutOfFocus(IPAContext &context)
+ {
+-	const uint32_t diff_var = std::abs(currentVariance_ -
+-					   context.activeState.af.maxVariance);
++	/* ⚠️ 2026-08-08: uint32_t → double — 归一化后方差为小数
++	 * (0.002-0.2), uint32_t 截断使 diff 恒 0 → 失焦检测失效 */
++	const double diff_var = std::abs(currentVariance_ -
++					context.activeState.af.maxVariance);
+ 	const double var_ratio = diff_var / context.activeState.af.maxVariance;
+ 
+ 	LOG(IPU3Af, Debug) << "Variance change rate: "
+ 			   << var_ratio
+-			   << " Current VCM step: "
+-			   << context.activeState.af.focus;
++			   << " cur=" << currentVariance_
++			   << " max=" << context.activeState.af.maxVariance
++			   << " step=" << context.activeState.af.focus;
+ 
+-	if (var_ratio > kMaxChange)
++	if (var_ratio > kMaxChange) {
+ 		return true;
+-	else
++	} else {
++		/* ⚠️ 自适应基准 (2026-08-08): 未失焦时 maxVariance 缓慢跟随
++		 * 当前方差 (0.95/0.05, 时间常数 ~0.7s) — 归一化只消除增益
++		 * 缩放, 场景亮度/mean 变化仍会使基准漂移 → 慢漂移被跟随,
++		 * 剧烈变化 (真失焦) rate 仍超阈值触发 */
++		context.activeState.af.maxVariance =
++			0.95 * context.activeState.af.maxVariance
++			+ 0.05 * currentVariance_;
+ 		return false;
++	}
++}
++
++/**
++ * \brief Parse request controls (AfMode/AfTrigger/LensPosition)
++ * \param[in] context The shared IPA context
++ * \param[in] frame The frame context sequence number
++ * \param[in] frameContext The current frame context
++ * \param[in] controls The controls for the request
++ *
++ * ⚠️ 2026-08-08 (全新): 三模式支持 — libcamerasrc 的 af-mode / af-trigger /
++ * lens-position 属性经 controls 到达 IPA, 在这里解析并驱动状态机。
++ */
++void Af::queueRequest(IPAContext &context, [[maybe_unused]] const uint32_t frame,
++		      [[maybe_unused]] IPAFrameContext &frameContext,
++		      const ControlList &controls)
++{
++	/* AfMode: 0=manual 1=auto 2=continuous */
++	if (controls.contains(controls::AfMode.id())) {
++		int32_t mode = controls.get(controls::AfMode).value();
++		if (mode != afMode_) {
++			LOG(IPU3Af, Debug) << "AF mode: " << afMode_ << " -> " << mode;
++			afMode_ = mode;
++			/* 模式切换语义 (libcamera 规范):
++			 * - 进入 manual: 停止所有扫描, 镜头由 LensPosition 控制
++			 * - 进入 auto:   idle 等待 AfTrigger
++			 * - 进入 continuous: 立即开始扫描 (原版行为)
++			 * ⚠️ 2026-08-09 (用户要求): auto→continuous 回退时若已
++			 * 对焦 (auto 锁定过) 保留对焦状态 (focus/maxVariance),
++			 * 直接进失焦检测 — 对焦准不重扫, 不准 (diff/max>0.4)
++			 * 才触发重扫; 仅未锁定过 (初始/手动后) 才 afReset 初始扫描 */
++			if (mode == controls::AfModeContinuous) {
++				if (locked_) {
++					context.activeState.af.stable = true;
++					baselineFrames_ = kBaselineFrames;
++				} else {
++					afReset(context);
++					context.activeState.af.stable = false;
++				}
++			} else if (mode == controls::AfModeManual) {
++				afReset(context);
++				context.activeState.af.stable = true;
++			} else /* auto */ {
++				afReset(context);
++				context.activeState.af.stable = true; /* idle, 等触发 */
++			}
++		}
++	}
++
++	/* AfTrigger: 0=Start (触发扫描) */
++	if (controls.contains(controls::AfTrigger.id())) {
++		int32_t trig = controls.get(controls::AfTrigger).value();
++		if (trig == controls::AfTriggerStart) {
++			LOG(IPU3Af, Debug) << "AF trigger received";
++			afTriggered_ = true;
++		}
++	}
++
++	/* LensPosition: manual 模式镜头位置 (dioptre) */
++	if (controls.contains(controls::LensPosition.id())) {
++		lensPosition_ = controls.get(controls::LensPosition).value();
++		if (afMode_ == controls::AfModeManual) {
++			/* dioptre → VCM step: 0(∞)→0, ~2.0D(最近)→1023 */
++			uint32_t step = std::clamp(
++				static_cast<uint32_t>(lensPosition_ / 2.0f * 1023.0f),
++				0U, kMaxFocusSteps);
++			focus_ = step;
++			context.activeState.af.focus = step;
++			LOG(IPU3Af, Debug) << "Manual lens position: "
++					   << lensPosition_ << "D -> step " << step;
++		}
++	}
++}
++
++/**
++ * \brief Start an auto-mode full scan (triggered)
++ * \param[in] context The shared IPA context
++ *
++ * ⚠️ 2026-08-08 (全新): auto 模式触发后, 全范围 0→1023 粗扫记录最大
++ * 方差位置, 再细扫精修, 完成后锁定 (locked_)。锁定期间不动作, 直到
++ * 再次 AfTrigger (router 侧 30s 超时回退 continuous 由心跳控制)。
++ */
++void Af::startAutoScan(IPAContext &context)
++{
++	context.activeState.af.stable = false;
++	locked_ = false;
++	forceScan_ = true;
++	forceScanStep_ = 0;
++	forceBestVariance_ = 0.0;
++	forceBestFocus_ = 0;
++		fineScan_ = false;
++		confirmPeak_ = false;
++		rescanCount_ = 0;
++		autoIdleFrames_ = 0;
++		bestFocusAll_ = 0;
++		bestVarianceAll_ = 0.0;
++		focus_ = 0;
++	context.activeState.af.focus = 0;
++	context.activeState.af.maxVariance = 0;
++	smoothedVariance_ = 0.0;
++	/* 起点 settle: 镜头移到 0 后等稳定再采 */
++	settleFrames_ = kIgnoreFrame;
++	ignoreCounter_ = 0;
++	LOG(IPU3Af, Debug) << "AF auto scan start (full range)";
++}
++
++/**
++ * \brief Auto-mode coarse scan (full range 0→1023)
++ * \param[in] context The shared IPA context
++ *
++ * 每 kCoarseSearchStep 步进, 移动后等 kSettleCoarseFrames 帧再采方差
++ * (C1'), 记录全局最大方差位置。扫描结束进入峰值确认 (C3)。
++ */
++void Af::autoScanCoarse(IPAContext &context)
++{
++	if (settleFrames_ > 0) {
++		settleFrames_--;
++		return;
++	}
++
++	/* 当前帧方差 (镜头已稳定) 用于峰值记录 */
++	if (currentVariance_ > forceBestVariance_) {
++		forceBestVariance_ = currentVariance_;
++		forceBestFocus_ = focus_;
++	}
++	/* ⚠️ 历史全局最佳 (跨 rescan 保留) */
++	if (currentVariance_ > bestVarianceAll_) {
++		bestVarianceAll_ = currentVariance_;
++		bestFocusAll_ = focus_;
++	}
++
++	forceScanStep_ += kCoarseSearchStep;
++	if (forceScanStep_ > kMaxFocusSteps) {
++		/* 全范围扫完 → 峰值确认 (C3): 回退 1 步重采, 防 settle 假峰值 */
++		forceScan_ = false;
++		confirmPeak_ = true;
++		confirmPeakFocus_ = forceBestFocus_;
++		/* 回退到 best - 半步 (5 步, 2026-08-08: 原 10 步对尖锐峰误判
++		 * 假峰值 → rescan 浪费; 半步仍在峰值邻域, 确认通过率大增) */
++		uint32_t back = (forceBestFocus_ > kCoarseSearchStep / 2)
++					? forceBestFocus_ - kCoarseSearchStep / 2 : 0;
++		focus_ = back;
++		context.activeState.af.focus = back;
++		settleFrames_ = kSettlePeakFrames;
++		LOG(IPU3Af, Debug) << "AF coarse done, best=" << forceBestFocus_
++				   << " var=" << forceBestVariance_
++				   << ", confirm at " << back;
++		return;
++	}
++
++	focus_ = forceScanStep_;
++	context.activeState.af.focus = forceScanStep_;
++	/* C1': 单调上升段 1 帧 settle (移动中方差趋势仍有效) */
++	settleFrames_ = kSettleCoarseFrames;
++}
++
++/**
++ * \brief Auto-mode peak confirmation (C3)
++ * \param[in] context The shared IPA context
++ *
++ * 粗扫结束后回退 1 步重采方差: 若仍 ≥ 记录的峰值方差, 确认峰值;
++ * 否则在回退点重新搜索 (峰值可能更近)。确认后进入细扫 (C4)。
++ */
++void Af::autoScanConfirmPeak(IPAContext &context)
++{
++	if (settleFrames_ > 0) {
++		settleFrames_--;
++		return;
++	}
++
++		if (currentVariance_ >= forceBestVariance_ * 0.9) {
++			/* 峰值确认 → 跳到最佳位置, settle 后细扫 */
++			LOG(IPU3Af, Debug) << "AF peak confirmed at " << confirmPeakFocus_;
++			/* ⚠️ 修复: 确认后必须清除, 否则 process 反复进 confirm 分支
++			 * (9bcd5bbb 的确认循环 bug: 永不进细扫/锁定) */
++			confirmPeak_ = false;
++			focus_ = confirmPeakFocus_;
++		context.activeState.af.focus = confirmPeakFocus_;
++		/* 细扫范围: best ±5% 全行程 */
++		fineScan_ = true;
++		fineScanStep_ = 0;
++		fineScanRange_ = static_cast<int32_t>(kMaxFocusSteps * kFineRange);
++		fineBestVariance_ = 0.0;
++		fineBestFocus_ = confirmPeakFocus_;
++		/* 细扫起点: best - range (⚠️ 固定, 轨迹基准) */
++		int32_t start = static_cast<int32_t>(confirmPeakFocus_) - fineScanRange_;
++		fineScanStart_ = std::max(0, start);
++		focus_ = fineScanStart_;
++		context.activeState.af.focus = focus_;
++		settleFrames_ = kSettleFineFrames;
++		} else {
++			/* 确认失败 (假峰值) → 在回退点重新粗扫 */
++			LOG(IPU3Af, Warning) << "AF peak confirm failed at "
++					     << confirmPeakFocus_ << ", rescan";
++			rescanCount_++;
++			if (rescanCount_ > kMaxRescan) {
++				/* ⚠️ 低对比度/多次假峰值: 放弃重扫, 围绕历史全局最佳
++				 * 直接细扫 (不再跳过细扫环节, 保证 ±1 精度) */
++				LOG(IPU3Af, Warning) << "AF rescan limit reached ("
++						   << rescanCount_ << "), fine scan around "
++						   << bestFocusAll_;
++				confirmPeak_ = false;
++				forceScan_ = false;
++				fineScan_ = true;
++				fineScanStep_ = 0;
++				fineScanRange_ = static_cast<int32_t>(kMaxFocusSteps * kFineRange);
++				fineBestVariance_ = 0.0;
++				fineBestFocus_ = bestFocusAll_;
++				int32_t fstart = static_cast<int32_t>(bestFocusAll_) - fineScanRange_;
++				fineScanStart_ = std::max(0, fstart);
++				focus_ = fineScanStart_;
++				context.activeState.af.focus = focus_;
++				settleFrames_ = kSettleFineFrames;
++				return;
++			}
++			forceScan_ = true;
++			forceScanStep_ = 0;
++			forceBestVariance_ = 0.0;
++			forceBestFocus_ = 0;
++			confirmPeak_ = false;
++			focus_ = 0;
++			context.activeState.af.focus = 0;
++			settleFrames_ = kSettlePeakFrames;
++		}
++}
++
++/**
++ * \brief Auto-mode fine scan (C4: 2 帧 settle)
++ * \param[in] context The shared IPA context
++ *
++ * 在粗扫最佳点 ±kFineRange 范围内步进 1, 每步 settle 2 帧 (VCM 充分
++ * 稳定), 记录最大方差位置, 完成后锁定。
++ */
++void Af::autoScanFine(IPAContext &context)
++{
++	if (settleFrames_ > 0) {
++		settleFrames_--;
++		return;
++	}
++
++	if (currentVariance_ > fineBestVariance_) {
++		fineBestVariance_ = currentVariance_;
++		fineBestFocus_ = focus_;
++	}
++
++	fineScanStep_ += kFineSearchStep;
++	if (fineScanStep_ > fineScanRange_ * 2) {
++		/* 细扫完成 → 锁定最佳位置 */
++		focus_ = fineBestFocus_;
++		context.activeState.af.focus = fineBestFocus_;
++		context.activeState.af.maxVariance = fineBestVariance_;
++		context.activeState.af.stable = true;
++		fineScan_ = false;
++		locked_ = true;
++		/* ⚠️ 2026-08-09 (A 方案): continuous 复用本链后, 扫描完成直接进
++		 * 失焦检测 → EMA 未收敛误判 → 加基准收敛期 (与 afFineScan 一致) */
++		baselineFrames_ = kBaselineFrames;
++		LOG(IPU3Af, Debug) << "AF locked at " << fineBestFocus_
++				   << " (fine)";
++		return;
++	}
++
++	/* 细扫轨迹: 固定起点 → +2*range (⚠️ 2026-08-08: 原用动态
++	 * fineBestFocus_ 做基准, 扫描中更新导致轨迹漂移/跳变 → 锁定
++	 * 到范围外的异常位置 (实测 154 vs 预期 360±51) */
++	int32_t next = fineScanStart_ + fineScanStep_;
++	focus_ = std::clamp(next, 0, static_cast<int32_t>(kMaxFocusSteps));
++	context.activeState.af.focus = focus_;
++	settleFrames_ = kSettleFineFrames;
+ }
+ 
+ /**
+@@ -411,13 +724,7 @@
+  * Ideally, a clear image also has a relatively higher contrast. So, every
+  * image for each focus step should be tested to find an optimal focus step.
+  *
+- * The Hill Climbing Algorithm[1] is used to find the maximum variance of the
+- * AF statistics which is the AF output of IPU3. The focus step is increased
+- * then the variance of the AF statistics are estimated. If it finds the
+- * negative derivative we have just passed the peak, and we infer that the best
+- * focus is found.
+- *
+- * [1] Hill Climbing Algorithm, https://en.wikipedia.org/wiki/Hill_climbing
++ * ⚠️ 2026-08-08 (全新): 三模式状态机。
+  */
+ void Af::process(IPAContext &context, [[maybe_unused]] const uint32_t frame,
+ 		 [[maybe_unused]] IPAFrameContext &frameContext,
+@@ -440,14 +747,97 @@
+ 	 */
+ 	currentVariance_ = afEstimateVariance(y_items, !coarseCompleted_);
+ 
+-	if (!context.activeState.af.stable) {
+-		afCoarseScan(context);
+-		afFineScan(context);
+-	} else {
+-		if (afIsOutOfFocus(context))
+-			afReset(context);
+-		else
++	/* C2: 方差滑动平均 (EMA), 抗低光噪声 / settle 过渡帧抖动 */
++	smoothedVariance_ = smoothedVariance_ == 0.0
++				? currentVariance_
++				: kVarEmaAlpha * currentVariance_
++					+ (1.0 - kVarEmaAlpha) * smoothedVariance_;
++	/* 状态机统一使用平滑方差 (峰值记录/判定) */
++	currentVariance_ = smoothedVariance_;
++
++	switch (afMode_) {
++	case controls::AfModeManual: /* 0: manual — LensPosition 已在 queueRequest 处理 */
++		/* 保持不动; 镜头位置由 queueRequest 中的 LensPosition 直接设置 */
++		context.activeState.af.stable = true;
++		break;
++
++	case controls::AfModeAuto: { /* 1: auto — 触发扫描 + 锁定 */
++		if (afTriggered_) {
++			afTriggered_ = false;
++			autoIdleFrames_ = 0;
++			startAutoScan(context);
++		}
++		if (locked_) {
++			context.activeState.af.stable = true;
++			break;
++		}
++		if (confirmPeak_) {
++			autoScanConfirmPeak(context);
++			break;
++		}
++		if (forceScan_) {
++			autoScanCoarse(context);
++			break;
++		}
++		if (fineScan_) {
++			autoScanFine(context);
++			break;
++		}
++		/* ⚠️ 兜底 (2026-08-08): auto idle 超时 — AfTrigger 因 request
++		 * 传递丢失 (gst 层 setProperty 与 applyControls 的 clear 竞争)
++		 * 时自动开始扫描, 保证触发可靠 */
++		if (++autoIdleFrames_ > kAutoIdleTimeoutFrames) {
++			LOG(IPU3Af, Debug) << "AF auto idle timeout, scan";
++			autoIdleFrames_ = 0;
++			startAutoScan(context);
++		}
++		break;
++	}
++
++	default: /* 2: continuous — ⚠️ 2026-08-09 (A 方案): 与 auto 同一套扫描链
++		 * (原 hill climbing afCoarseScan/afFineScan 单调前进+首降即停,
++		 * 局部峰/噪声误判 → 不准; 统一走 startAutoScan 全范围+confirm+细扫) */
++		/* 扫描链状态优先 (由 startAutoScan 设置) */
++		if (forceScan_) {
++			autoScanCoarse(context);
++			break;
++		}
++		if (confirmPeak_) {
++			autoScanConfirmPeak(context);
++			break;
++		}
++		if (fineScan_) {
++			autoScanFine(context);
++			break;
++		}
++		if (!context.activeState.af.stable) {
++			/* 初始/扫描后未稳定 → 启动全范围扫描 */
++			startAutoScan(context);
++			break;
++		}
++		/* 稳定: 基准收敛期 — 扫描后 EMA 未收敛, maxVariance 跟随当前
++		 * 方差 (0.5/0.5), 期间不判定失焦 (防 EMA 滞后误判重扫) */
++		if (baselineFrames_ > 0) {
++			baselineFrames_--;
++			context.activeState.af.maxVariance =
++				0.5 * context.activeState.af.maxVariance
++				+ 0.5 * currentVariance_;
++			outOfFocusFrames_ = 0;
++			break;
++		}
++		/* 失焦检测 → 连续 ≥5 帧超阈值 → 全范围重扫 (与 auto 同链) */
++		if (afIsOutOfFocus(context)) {
++			if (++outOfFocusFrames_ >= kOutOfFocusConfirmFrames) {
++				LOG(IPU3Af, Debug) << "AF out-of-focus confirmed ("
++					   << outOfFocusFrames_ << " frames)";
++				outOfFocusFrames_ = 0;
++				startAutoScan(context);
++			}
++		} else {
++			outOfFocusFrames_ = 0;
+ 			afIgnoreFrameReset();
++		}
++		break;
+ 	}
+ }
+ 
