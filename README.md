@@ -20,15 +20,18 @@ Lenovo MIIX 720-12IKB (80VV) 摄像头功能提升项目（合并版）。
 wireplumber 刷新机制），分项目维护易漏补丁、易配置冲突。合并后统一在
 `common/` 维护共享组件，两个摄像头功能作为两个独立 systemd 服务分别开发升级。
 
-**不包含**: IR 摄像头项目、ov5670 对焦功能项目（已回滚）、内核硬件驱动补丁（归硬件项目）。
+**不包含**: IR 摄像头项目、内核硬件驱动补丁（归硬件项目）。
+**包含（合并后重新实现）**: ov5670 后置自动对焦 — 合并项目完成**之后**进一步
+完全重构（v4l2loopback AF 控件 + router 桥接 + gst 插件 ENOBUFS 控件传递
+根治 + IPA IPU3Af 扫描链重构 + AfState 官方完成检测），见 `docs/ov5670-autofocus.md`。
 **发布**: 本项目已发布到 GitHub（GPL-3.0），欢迎参考与二次开发。补丁仅限
 v4l2loopback 虚拟摄像头层 + 用户态（router/gst 插件/IPA），系统部署涉及
 用户特定路径（systemd 服务用 `%h` 转义、脚本用 `$PROJECT_ROOT` 推导）。
 
 ## 版本控制策略（git 跟踪 vs 磁盘文件）
 
-**磁盘上存在但未被 git 跟踪的文件**均为"不入库"类别，忽略规则
-（`.gitignore`，含各子目录）持续有效——以下文件**从未被提交**（`git log --all`
+本项目 git 仅作本地版本管理。**磁盘上存在但未被 git 跟踪的文件**均为"不入库"类别，
+忽略规则（`.gitignore`，含各子目录）持续有效——以下文件**从未被提交**（`git log --all`
 验证，勿用 `git add -f` 强制加入，重编译后 `git status` 也不会显示它们）：
 
 | 类别 | 文件 | 不入库原因 |
@@ -116,12 +119,15 @@ sudo python3 common/v4l2loopback-patches/apply_all.py
 # 然后编译/签名/安装 — 完整流程见 docs/UPGRADE.md
 ```
 
-## 后置自动对焦与画质（2026-08-08）
+## 后置自动对焦与画质（2026-08-10 最终形态）
 
-- **自动对焦**：OV5670 (IPU3) 三模式对焦完整修复（触发可靠性跨帧重发、
-  失焦判定归一化方差/自适应基准/连续确认、auto 扫描精度细扫固定轨迹、
-  40s 锁定窗口），详见 `docs/ov5670-autofocus.md` 与
-  `back_camera/ipa-patches/`。
+- **自动对焦**：OV5670 (IPU3) 三模式对焦完整实现（合并后完全重构）：
+  - 控件链路：v4l2loopback AF 控件 → router 桥接 → gst 插件（**ENOBUFS
+    retainControls 控件传递根治**，不再丢控件）
+  - 扫描链：af_trigger 触发 → 粗扫（最多 2 次）→ 峰值确认 → 精扫 → 锁定
+  - 完成检测：**AfState 官方控件**（200ms 轮询，扫描完成即回 manual，
+    无固定定时器）；扫描中忽略手动移镜（防打断）
+  - 详见 `docs/ov5670-autofocus.md` 与 `back_camera/ipa-patches/`。
 - **画质调校**：`back_camera/tuning/ov5670.yaml`（AGC 目标亮度 0.35，
   实测亮度提亮 3 倍）；Intel 官方 ov5670 AIQ 调校（Apache 2.0）已归档
   供后续完整 3A 调校。
