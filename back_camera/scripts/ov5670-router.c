@@ -55,6 +55,9 @@
 static GstElement *pipeline = NULL;
 static GstElement *cam_src = NULL;     // libcamerasrc (状态控制: PAUSED↔PLAYING)
 static bool cam_active = false;
+/* ⚠️ 2026-08-10 (无应用误对焦修复): reader 连续判定计数 (±3 = 3s 一致
+ * 才 activate/deactivate) — inotify 复查与定期复查共用 (跨线程, 简单 int) */
+static int reader_streak = 0;
 /* ⚠️ 2026-08-10 (扫描中断修复): 单次对焦扫描中 (临时 auto) — abs 忽略 */
 static bool af_scanning = false;
 /* ⚠️ 2026-08-10 (兜底计时取消): AfState 完成检测到扫描结束时, 取消
@@ -143,11 +146,15 @@ static void deactivate_camera(void) {
         pthread_mutex_unlock(&lock);
         return;
     }
-    // C': PLAYING→PAUSED (停流, 保持 open/acquire — 下次 activate 直接开流)
-    gst_element_set_state(cam_src, GST_STATE_PAUSED);
+    // C'': 2026-08-10 (无应用误对焦修复): PAUSED 不停流 — libcamerasrc
+    // PLAYING_TO_PAUSED 不停 task (gstlibcamerasrc.cpp 993) + libcamera
+    // request 循环继续 → IPA 持续有帧 → 无应用时 continuous 对焦一直跑
+    // (用户实测)。改 READY: camera 保持 open (NULL_TO_READY 才 open) 但
+    // 未 start → IPA 无帧。activate 时 sync_state_with_parent 恢复。
+    gst_element_set_state(cam_src, GST_STATE_READY);
     cam_active = false;
     pthread_mutex_unlock(&lock);
-    log_msg("OV5670 已释放 (cam PAUSED, 停流保持 acquire)");
+    log_msg("OV5670 已释放 (cam READY, 停流 camera 未 start)");
 }
 
 // ---------- reader check (轮询 /proc) ----------
@@ -203,9 +210,17 @@ static bool has_real_reader(void) {
                 fclose(cf);
                 for (size_t i = 0; i < cn; i++) if (cmdline[i] == 0) cmdline[i] = ' ';
             }
-            if (strstr(cmdline, "pipewire") || strstr(cmdline, "wireplumber")) {
-                // PipeWire 消费端 (Snapshot/OBS 走 portal) 是真正的 reader!
-                // wireplumber 枚举是瞬时 open/close, 由 inotify 的延迟复查排除
+            if (strstr(cmdline, "wireplumber")) {
+                /* ⚠️ 2026-08-10 (无应用误对焦修复): wireplumber 是设备
+                 * 管理器 — 打开 V4L2 设备只为枚举/探测, 从不消费流。
+                 * 之前算 reader → 枚举周期与复查窗口碰撞 → 流被误激活
+                 * → 无应用时 continuous 对焦一直跑。排除。 */
+                log_msg("  probe(WP): PID=%s cmd=%s", ent->d_name, cmdline);
+                continue;
+            }
+            if (strstr(cmdline, "pipewire")) {
+                /* PipeWire: portal 消费端 (Snapshot/OBS) 是真实 reader,
+                 * 但也可能枚举探测 — 由调用方连续判定 (streak) 把关 */
                 log_msg("  reader(PW): PID=%s cmd=%s", ent->d_name, cmdline);
                 found = true;
                 break;
@@ -239,11 +254,19 @@ static int64_t af_busy_start_ms = 0;
 
 static gboolean confirm_reader_cb(gpointer user_data) {
     (void)user_data;
+    /* ⚠️ 2026-08-10 (无应用误对焦修复): 连续判定 — 单次快照不动作,
+     * 连续 3 次一致 (≈3s) 才 activate/deactivate。防 wireplumber/
+     * pipewire 枚举探测 (短暂 fd) 误激活流 → 无应用时 continuous 对焦。 */
     bool has = has_real_reader();
-    log_msg("复查 reader: %s", has ? "有" : "无");
-    if (has && !cam_active) {
+    log_msg("复查 reader: %s (streak=%d)", has ? "有" : "无", reader_streak);
+    if (has) {
+        if (reader_streak < 3) reader_streak++;
+    } else {
+        if (reader_streak > -3) reader_streak--;
+    }
+    if (reader_streak >= 3 && !cam_active) {
         activate_camera();
-    } else if (!has && cam_active) {
+    } else if (reader_streak <= -3 && cam_active) {
         deactivate_camera();
     }
     return G_SOURCE_REMOVE;
@@ -647,12 +670,18 @@ static void *af_poll_thread(void *arg) {
         usleep(AF_POLL_MS * 1000);
         if (af_fd < 0) break;
 
-        /* 定期兜底复查 (每 1s): 与 inotify 复查互补, 防事件丢失 */
+        /* 定期兜底复查 (每 1s): 与 inotify 复查互补, 防事件丢失。
+         * ⚠️ 2026-08-10: 连续判定 (streak) — 单次快照不动作 */
         if (++reader_check_cnt % 10 == 0) {
             bool has = has_real_reader();
-            if (has && !cam_active) {
+            if (has) {
+                if (reader_streak < 3) reader_streak++;
+            } else {
+                if (reader_streak > -3) reader_streak--;
+            }
+            if (reader_streak >= 3 && !cam_active) {
                 activate_camera();
-            } else if (!has && cam_active) {
+            } else if (reader_streak <= -3 && cam_active) {
                 deactivate_camera();
             }
         }
@@ -832,11 +861,11 @@ int main(int argc, char **argv) {
     GstState state;
     gst_element_get_state(pipeline, &state, NULL, 10 * GST_SECOND);
 
-    // C': pipeline 启动时 cam_src 被强制 PLAYING (CAM6 短暂流, open/acquire/
-    // 配置完成 — 与 gst-launch 语义对齐)。立即设回 PAUSED (停流但保持 open/
-    // acquire): 按需 (activate 才 PLAYING), 且不重新 open (C' 核心)。
-    gst_element_set_state(cam_src, GST_STATE_PAUSED);
-    log_msg("ov5670-router 启动: %s 常驻 (cam PAUSED, 按需 activate)", SINK_DEVICE);
+    // C'': 2026-08-10 (无应用误对焦修复): 启动后停流改 READY (PAUSED 不停
+    // 流 — libcamerasrc PLAYING_TO_PAUSED 不停 task → IPA 持续有帧 → 无
+    // 应用时 continuous 对焦一直跑)。READY 保持 open, 未 start → IPA 无帧。
+    gst_element_set_state(cam_src, GST_STATE_READY);
+    log_msg("ov5670-router 启动: %s 常驻 (cam READY, 按需 activate)", SINK_DEVICE);
 
     af_init();   // 对焦转发 (2026-08-08): 默认 continuous + 控件轮询
     setup_inotify();
