@@ -222,6 +222,38 @@ Lenovo MIIX 720 (80VV) 后置 OV5670 (IPU3 管线) 自动对焦功能增强与�
   gstlibcamerasrc.cpp/gstlibcamera-controls.cpp.in/gen-gst-controls.py)
   → `ninja -C build-new` 重编 → 安装。
 
+### 10. 无应用时 continuous 对焦一直跑 (61121e6) — 停流根治
+
+**用户实测**: 未运行任何相机应用时, OV5670 仍在 continuous 自动对焦
+(镜头持续动作)。**按设计**: 无消费者应停流, 无帧 → IPA 不处理 → 不对焦。
+
+**根因链 (三处)**:
+1. `has_real_reader()` 把 **wireplumber 枚举 fd 算 reader** —
+   wireplumber 是设备管理器, 打开 V4L2 设备只为枚举/探测, 从不消费流。
+   其枚举周期与复查窗口碰撞 → 流被误激活 → continuous 对焦跑。
+2. 复查 (inotify 600ms + 定期 1s) 是**单次快照即动作** — wireplumber
+   短暂 fd 命中即激活; 频繁枚举则永不释放。
+3. `deactivate` 设 cam_src **PAUSED 不停流** — libcamerasrc
+   `PLAYING_TO_PAUSED` 转换不停 task (gstlibcamerasrc.cpp:993, 上游
+   实现与 READY_TO_PAUSED 的 task_pause 不一致) + libcamera request
+   循环继续 → **IPA 持续有帧** → 无应用也扫描。
+
+**修复 (三处)**:
+1. `has_real_reader()` 排除 wireplumber (`probe(WP)` 不算 reader)。
+2. **reader_streak 连续判定**: ±3 (≈3s 一致) 才 activate/deactivate —
+   inotify 复查 + 定期复查统一走 streak; 枚举探测 (短暂 fd) 达不到
+   连续 → 不误激活。
+3. deactivate/启动停流改 **READY** (camera 保持 open — NULL_TO_READY
+   才 open — 但未 start → IPA 无帧); activate 用
+   `gst_element_sync_state_with_parent` 恢复 (READY→PAUSED→PLAYING)。
+
+**验证** (ad-hoc PASS=11 FAIL=0): 无应用 IPA 0 活动 + 0 激活; 起流
+streak +3 激活 + IPA 对焦 (rescan/fine); 关闭 streak -3 释放 (READY)
++ IPA 停流。
+
+**注意**: 释放延迟 ≈3s (streak 连续判定), 启动激活延迟 ≈3s — 设计
+取舍, 换取枚举探测免疫。
+
 ## 验证
 
 - 全链路: 触发 → AfMode/AfTrigger 到达 (ENOBUFS retainControls 保证)
@@ -231,6 +263,8 @@ Lenovo MIIX 720 (80VV) 后置 OV5670 (IPU3 管线) 自动对焦功能增强与�
   忽略手动移镜 (af_scanning) ③无定时器中途切走。
 - continuous 静止稳定性: 0 误判重扫, rate 稳定 0.3-3% (阈值 40%);
   手动→continuous 切换先失焦判断 (连续 5 帧超阈值) 再决定重扫。
+- **无应用停流**: 无消费者时 IPA 0 活动 + 0 激活 (wireplumber 枚举
+  免疫 + streak 连续判定 + READY 停流); 起流 ~3s 激活, 关闭 ~3s 释放。
 - 验证脚本归档: `docs/scripts/verification/` (ad-hoc, PASS=N FAIL=0 模式)。
 
 ## 相关文件
