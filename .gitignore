@@ -1,0 +1,30 @@
+# 编译产物 (源码为准; 从未被 git 跟踪, 忽略规则有效 — 勿 add -f)
+back_camera/scripts/ov5670-router
+*.pyc
+__pycache__/
+
+# 大文件/原始数据 (如需发布请单独处理)
+docs/archive/*.bin
+
+# 构建资产与回滚备份 (大文件, 不提交 git)
+back_camera/build-sources/*.tar.gz
+back_camera/backups/*.bak-*
+
+# 回滚备份 (统一不入库; 2026-08-09 起 .bak 一律忽略, 历史已跟踪的已 git rm --cached)
+*.bak
+
+# 系统/部署文件 (含用户路径, 不发布)
+*.service.bak
+docs/backup-20260808/
+back_camera/build-sources/*.tar.gz*
+*.bak-*
+.vscode/
+
+# 发布排除: 抓帧数据/编译产物/专有二进制 (2026-08-12 开源前清理)
+back_camera/calibration-frames/
+back_camera/backups/*.so*
+# Windows 调校: 只排除专有二进制, 保留逆向文档/源码/CSV (README/aiqb-*.c/py/lsc CSV)
+back_camera/calibration/windows-tuning/*.cpf
+back_camera/calibration/windows-tuning/*.bin
+back_camera/calibration/windows-tuning/*.aiqd
+back_camera/calibration/windows-tuning/*.sys

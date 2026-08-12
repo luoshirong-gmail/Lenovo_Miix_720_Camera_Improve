@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: CC0-1.0
+# ov5670 tuning — imgU 全链路校准版 v2 (2026-08-12)
+# 基于白盖板参考图 (calibration-frames/ref-01..05, 均匀白场) 校准:
+#   - Awb 补偿: redCompensation 0.8 (减弱 red), blueCompensation 1.3 (加强 blue)
+#   - Ccm 单位矩阵: 消除驱动默认 CCM (B 1.97x/R 1.19x, Intel 参考 sensor 标定)
+#     与本机 OV5670 不匹配导致的偏紫 (无色卡, 先用单位矩阵; 有色卡后可标定真矩阵)
+#   - 链路已验证: CCM (acc 静态) 生效 (R 翻倍 → V=+50), AWB/bnr 生效
+#   - LSC/SHD: 固件 (2016) 不执行 op_list 传输 — 硬件 LSC 不可用
+# 其余算法默认 (Af/Agc/BlackLevelCorrection/ToneMapping)
+%YAML 1.1
+---
+version: 1
+algorithms:
+  - Af:
+  - Agc:
+  - Awb:
+      redCompensation: 0.8
+      blueCompensation: 1.3
+  - Ccm:
+      ccms:
+        - ct: 2500
+          ccm: [[1.0, 0, 0], [0, 1.0, 0], [0, 0, 1.0]]
+          offsets: [0, 0, 0]
+        - ct: 4500
+          ccm: [[1.0, 0, 0], [0, 1.0, 0], [0, 0, 1.0]]
+          offsets: [0, 0, 0]
+        - ct: 6500
+          ccm: [[1.0, 0, 0], [0, 1.0, 0], [0, 0, 1.0]]
+          offsets: [0, 0, 0]
+  - BlackLevelCorrection:
+  - ToneMapping:
+...

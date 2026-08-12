@@ -1,0 +1,14 @@
+[Unit]
+Description=OV5670 virtual camera - fix v4l2loopback exclusive_caps after boot
+# systemd-modules-load 加载模块后运行; 在 user 会话 (graphical) 之前完成,
+# 此时无应用使用 v4l2loopback 设备, 重载安全
+After=systemd-modules-load.service
+Wants=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ov5670-ec-fix.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,22 @@
+# 编译产物 (源码为准: gcc -O2 -Wall -o camera-router camera-router.c ...)
+pipeline/camera-router
+
+# Logs / temp
+*.log
+/tmp/
+*.tmp
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Systemd / runtime artifacts
+*.service.bak
+
+# Local config overrides
+*.local.conf

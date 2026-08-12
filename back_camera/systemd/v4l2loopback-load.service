@@ -1,0 +1,14 @@
+[Unit]
+Description=Load v4l2loopback module via modprobe command (full modprobe.d options)
+# 2026-08-09 fix: systemd-modules-load (kmod lib) loads v4l2loopback without
+# proper options handling -> add-device AF controls missing (0/3). Use modprobe
+# command instead (identical to manual reload, add controls 3/3).
+After=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+ExecStart=/sbin/modprobe v4l2loopback
+RemainAfterExit=yes
+
+[Install]
+WantedBy=sysinit.target

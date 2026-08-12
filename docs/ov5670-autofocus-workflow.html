@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OV5670 对焦处理逻辑 — 实体/事件/时间线综合工作原理图</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'JetBrains Mono', monospace;
+      background: #020617;
+      min-height: 100vh;
+      padding: 2rem;
+      color: white;
+    }
+    .container { max-width: 1400px; margin: 0 auto; }
+    .header { margin-bottom: 1.5rem; }
+    .header-row { display: flex; align-items: center; gap: 1rem; margin-bottom: 0.5rem; }
+    .pulse-dot { width: 12px; height: 12px; background: #22d3ee; border-radius: 50%; animation: pulse 2s infinite; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+    h1 { font-size: 1.4rem; font-weight: 700; letter-spacing: -0.025em; }
+    .subtitle { color: #94a3b8; font-size: 0.85rem; margin-left: 1.75rem; }
+    .diagram-container {
+      background: rgba(15, 23, 42, 0.5);
+      border-radius: 1rem;
+      border: 1px solid #1e293b;
+      padding: 1.5rem;
+      overflow-x: auto;
+    }
+    svg { width: 100%; min-width: 1200px; display: block; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1rem; margin-top: 1.5rem; }
+    .card { background: rgba(15, 23, 42, 0.5); border-radius: 0.75rem; border: 1px solid #1e293b; padding: 1.25rem; }
+    .card-header { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.75rem; }
+    .card-dot { width: 8px; height: 8px; border-radius: 50%; }
+    .card-dot.cyan { background: #22d3ee; }
+    .card-dot.emerald { background: #34d399; }
+    .card-dot.violet { background: #a78bfa; }
+    .card-dot.amber { background: #fbbf24; }
+    .card-dot.rose { background: #fb7185; }
+    .card-dot.orange { background: #fb923c; }
+    .card h3 { font-size: 0.9rem; font-weight: 600; }
+    .card ul { list-style: none; color: #94a3b8; font-size: 0.78rem; }
+    .card li { margin-bottom: 0.4rem; }
+    .card code { color: #e2e8f0; background: rgba(148,163,184,0.15); padding: 0 4px; border-radius: 3px; font-size: 0.72rem; }
+    .footer { text-align: center; margin-top: 1.5rem; color: #475569; font-size: 0.75rem; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <div class="header-row">
+        <div class="pulse-dot"></div>
+        <h1>OV5670 对焦处理逻辑 — 综合工作原理图</h1>
+      </div>
+      <p class="subtitle">实体 · 事件 · 时间线 综合视图 (Lenovo MIIX 720 后摄, ov5670-router.c + libcamerasrc + IPA, 2026-08-09)</p>
+    </div>
+
+    <div class="diagram-container">
+      <svg viewBox="0 0 1380 1720">
+        <defs>
+          <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#64748b" />
+          </marker>
+          <marker id="arrowhead-cyan" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#22d3ee" />
+          </marker>
+          <marker id="arrowhead-emerald" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#34d399" />
+          </marker>
+          <marker id="arrowhead-violet" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#a78bfa" />
+          </marker>
+          <marker id="arrowhead-orange" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#fb923c" />
+          </marker>
+          <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+            <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#1e293b" stroke-width="0.5"/>
+          </pattern>
+        </defs>
+
+        <rect width="100%" height="100%" fill="url(#grid)" />
+
+        <!-- ══════════════════════════════════════════════════════════════
+             SECTION 1: 实体层 (Entities) — 泳道式从左到右数据流
+             ══════════════════════════════════════════════════════════════ -->
+        <rect x="20" y="20" width="1340" height="330" rx="12" fill="rgba(34,211,238,0.04)" stroke="#155e75" stroke-width="1" stroke-dasharray="8,4"/>
+        <text x="40" y="48" fill="#22d3ee" font-size="13" font-weight="700">① 实体层 ENTITIES — 对焦链参与者与数据流</text>
+
+        <!-- 实体 1: 相机应用 (External) -->
+        <rect x="40" y="90" width="170" height="100" rx="6" fill="rgba(30, 41, 59, 0.5)" stroke="#94a3b8" stroke-width="1.5"/>
+        <text x="125" y="115" fill="white" font-size="11" font-weight="600" text-anchor="middle">相机应用</text>
+        <text x="125" y="132" fill="#94a3b8" font-size="8.5" text-anchor="middle">qv4l2 / 系统相机</text>
+        <text x="125" y="146" fill="#94a3b8" font-size="8" text-anchor="middle">(通过 V4L2 控件交互)</text>
+        <text x="125" y="175" fill="#fbbf24" font-size="8" text-anchor="middle">勾选 focus_auto</text>
+        <text x="125" y="187" fill="#fbbf24" font-size="8" text-anchor="middle">拖 focus_absolute</text>
+
+        <!-- 实体 2: v4l2 控件面 (Frontend) -->
+        <rect x="250" y="90" width="200" height="100" rx="6" fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+        <text x="350" y="115" fill="white" font-size="11" font-weight="600" text-anchor="middle">v4l2loopback 控件面</text>
+        <text x="350" y="132" fill="#94a3b8" font-size="8.5" text-anchor="middle">/dev/video16 (video16)</text>
+        <text x="350" y="150" fill="#7dd3fc" font-size="8" text-anchor="middle">focus_auto    0x009A090C (bool)</text>
+        <text x="350" y="164" fill="#7dd3fc" font-size="8" text-anchor="middle">focus_abs     0x009A090A (0-1023)</text>
+        <text x="350" y="178" fill="#7dd3fc" font-size="8" text-anchor="middle">af_trigger    0x0098F904 (int)</text>
+
+        <!-- 实体 3: router (Backend) -->
+        <rect x="500" y="80" width="230" height="120" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
+        <text x="615" y="105" fill="white" font-size="11" font-weight="600" text-anchor="middle">ov5670-router (C)</text>
+        <text x="615" y="122" fill="#94a3b8" font-size="8.5" text-anchor="middle">af_poll_thread (100ms 轮询)</text>
+        <text x="615" y="136" fill="#94a3b8" font-size="8.5" text-anchor="middle">GMainLoop (事件/定时器)</text>
+        <text x="615" y="152" fill="#6ee7b7" font-size="8" text-anchor="middle">G_EXT 读控件 (500ms)</text>
+        <text x="615" y="164" fill="#6ee7b7" font-size="8" text-anchor="middle">S_EXT/S_CTRL 写回 (进程内)</text>
+        <text x="615" y="176" fill="#6ee7b7" font-size="8" text-anchor="middle">g_object_set 属性 (异步)</text>
+        <text x="615" y="190" fill="#fbbf24" font-size="7.5" text-anchor="middle">inotify 监控 video16 OPEN/CLOSE</text>
+
+        <!-- 实体 4: libcamerasrc (Backend) -->
+        <rect x="780" y="80" width="220" height="120" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
+        <text x="890" y="105" fill="white" font-size="11" font-weight="600" text-anchor="middle">libcamerasrc (GStreamer)</text>
+        <text x="890" y="122" fill="#94a3b8" font-size="8.5" text-anchor="middle">元素属性 (P3 补丁)</text>
+        <text x="890" y="140" fill="#6ee7b7" font-size="8" text-anchor="middle">af-mode       0/1/2</text>
+        <text x="890" y="154" fill="#6ee7b7" font-size="8" text-anchor="middle">af-trigger    Start=0</text>
+        <text x="890" y="168" fill="#6ee7b7" font-size="8" text-anchor="middle">lens-position dioptre</text>
+        <text x="890" y="182" fill="#fbbf24" font-size="7.5" text-anchor="middle">af-state      0/1/2/3 (只读)</text>
+        <text x="890" y="196" fill="#fbbf24" font-size="7.5" text-anchor="middle">⚠ 跨线程: streaming 线程</text>
+
+        <!-- 实体 5: libcamera 管线 (Message Bus) -->
+        <rect x="1040" y="80" width="150" height="120" rx="6" fill="rgba(251, 146, 60, 0.3)" stroke="#fb923c" stroke-width="1.5"/>
+        <text x="1115" y="105" fill="white" font-size="11" font-weight="600" text-anchor="middle">libcamera 管线</text>
+        <text x="1115" y="125" fill="#fdba74" font-size="8" text-anchor="middle">applyControls()</text>
+        <text x="1115" y="139" fill="#fdba74" font-size="8" text-anchor="middle">merge(controls_)</text>
+        <text x="1115" y="153" fill="#fdba74" font-size="8" text-anchor="middle">+ clear() 每帧</text>
+        <text x="1115" y="175" fill="#f87171" font-size="7.5" text-anchor="middle">⚠ ENOBUFS: buffer 池不足</text>
+        <text x="1115" y="187" fill="#f87171" font-size="7.5" text-anchor="middle">→ request 丢弃 → retainControls</text>
+
+        <!-- 实体 6: IPA (Database) -->
+        <rect x="1080" y="240" width="170" height="95" rx="6" fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+        <text x="1165" y="265" fill="white" font-size="11" font-weight="600" text-anchor="middle">IPA IPU3Af</text>
+        <text x="1165" y="283" fill="#c4b5fd" font-size="8" text-anchor="middle">AfTriggerStart → 扫描</text>
+        <text x="1165" y="297" fill="#c4b5fd" font-size="8" text-anchor="middle">auto: 全范围链 (20/2)</text>
+        <text x="1165" y="311" fill="#c4b5fd" font-size="8" text-anchor="middle">continuous: 统一复用 auto 链</text>
+        <text x="1165" y="325" fill="#c4b5fd" font-size="8" text-anchor="middle">metadata 输出 AfState (0-3)</text>
+
+        <!-- 实体 7: VCM (External) -->
+        <rect x="890" y="250" width="140" height="70" rx="6" fill="rgba(30, 41, 59, 0.5)" stroke="#94a3b8" stroke-width="1.5"/>
+        <text x="960" y="275" fill="white" font-size="11" font-weight="600" text-anchor="middle">VCM 镜头</text>
+        <text x="960" y="293" fill="#94a3b8" font-size="8.5" text-anchor="middle">dw9719 音圈马达</text>
+        <text x="960" y="307" fill="#94a3b8" font-size="8" text-anchor="middle">物理对焦</text>
+
+        <!-- 实体间箭头 -->
+        <!-- 应用 → 控件 -->
+        <line x1="210" y1="140" x2="248" y2="140" stroke="#22d3ee" stroke-width="1.5" marker-end="url(#arrowhead-cyan)"/>
+        <text x="229" y="132" fill="#7dd3fc" font-size="7.5" text-anchor="middle">写控件</text>
+        <!-- 控件 → router -->
+        <line x1="450" y1="140" x2="498" y2="140" stroke="#34d399" stroke-width="1.5" marker-end="url(#arrowhead-emerald)"/>
+        <text x="474" y="132" fill="#6ee7b7" font-size="7.5" text-anchor="middle">G_EXT 读</text>
+        <!-- router → 控件 (写回, 虚线) -->
+        <line x1="498" y1="168" x2="450" y2="168" stroke="#34d399" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrowhead-emerald)"/>
+        <text x="474" y="182" fill="#6ee7b7" font-size="7.5" text-anchor="middle">S_EXT 写回</text>
+        <!-- router → libcamerasrc -->
+        <line x1="730" y1="140" x2="778" y2="140" stroke="#34d399" stroke-width="1.5" marker-end="url(#arrowhead-emerald)"/>
+        <text x="754" y="132" fill="#6ee7b7" font-size="7.5" text-anchor="middle">g_object_set</text>
+        <!-- libcamerasrc → 管线 -->
+        <line x1="1000" y1="140" x2="1038" y2="140" stroke="#fb923c" stroke-width="1.5" marker-end="url(#arrowhead-orange)"/>
+        <text x="1019" y="132" fill="#fdba74" font-size="7.5" text-anchor="middle">setProperty</text>
+        <!-- 管线 → IPA -->
+        <path d="M 1115 200 L 1115 238" fill="none" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arrowhead-violet)"/>
+        <text x="1127" y="222" fill="#c4b5fd" font-size="7.5">request 控件</text>
+        <!-- IPA → VCM -->
+        <line x1="1078" y1="285" x2="1032" y2="285" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arrowhead-violet)"/>
+        <text x="1055" y="277" fill="#c4b5fd" font-size="7.5" text-anchor="middle">VCM 步进</text>
+        <!-- 实体 1 下方注释: 应用循环 -->
+        <text x="125" y="218" fill="#64748b" font-size="7.5" text-anchor="middle">焦点前景物固定 → AF 重扫无变化属正常</text>
+        <text x="125" y="230" fill="#64748b" font-size="7.5" text-anchor="middle">验证须用 AfTrigger 强制触发</text>
+
+        <!-- ══════════════════════════════════════════════════════════════
+             SECTION 2: 事件层 (Events) — 触发路径与状态机
+             ══════════════════════════════════════════════════════════════ -->
+        <rect x="20" y="370" width="1340" height="560" rx="12" fill="rgba(52,211,153,0.04)" stroke="#065f46" stroke-width="1" stroke-dasharray="8,4"/>
+        <text x="40" y="398" fill="#34d399" font-size="13" font-weight="700">② 事件层 EVENTS — 三条触发路径 (手动 / 自动 / 连续) 与关键竞态</text>
+
+        <!-- 事件区背景: 3 条泳道 -->
+        <rect x="40" y="420" width="400" height="480" rx="8" fill="rgba(148,163,184,0.05)" stroke="#334155" stroke-width="1"/>
+        <text x="240" y="442" fill="#fbbf24" font-size="10" font-weight="600" text-anchor="middle">路径 A — MANUAL 手动</text>
+
+        <rect x="470" y="420" width="400" height="480" rx="8" fill="rgba(148,163,184,0.05)" stroke="#334155" stroke-width="1"/>
+        <text x="670" y="442" fill="#22d3ee" font-size="10" font-weight="600" text-anchor="middle">路径 B — AUTO 自动触发</text>
+
+        <rect x="900" y="420" width="440" height="480" rx="8" fill="rgba(148,163,184,0.05)" stroke="#334155" stroke-width="1"/>
+        <text x="1120" y="442" fill="#a78bfa" font-size="10" font-weight="600" text-anchor="middle">路径 C — CONTINUOUS 连续 + 竞态标注</text>
+
+        <!-- ─── 路径 A: MANUAL ─── -->
+        <!-- A1 -->
+        <rect x="60" y="460" width="360" height="44" rx="6" fill="rgba(30,41,59,0.6)" stroke="#fbbf24" stroke-width="1"/>
+        <text x="70" y="478" fill="#fbbf24" font-size="8.5" font-weight="600">A1 · 用户拖动 focus_absolute (值变化)</text>
+        <text x="70" y="494" fill="#94a3b8" font-size="7.5">或 focus_auto 1→0 (标准语义)</text>
+        <!-- A2 -->
+        <rect x="60" y="516" width="360" height="44" rx="6" fill="rgba(30,41,59,0.6)" stroke="#fbbf24" stroke-width="1"/>
+        <text x="70" y="534" fill="#fbbf24" font-size="8.5" font-weight="600">A2 · router: af_apply_mode(0) → manual</text>
+        <text x="70" y="550" fill="#94a3b8" font-size="7.5">S_CTRL 写回 focus_auto=0 (控件与 IPA 状态一致)</text>
+        <!-- A3 -->
+        <rect x="60" y="572" width="360" height="44" rx="6" fill="rgba(30,41,59,0.6)" stroke="#fbbf24" stroke-width="1"/>
+        <text x="70" y="590" fill="#fbbf24" font-size="8.5" font-weight="600">A3 · router: 一次性设置 (无心跳)</text>
+        <text x="70" y="606" fill="#94a3b8" font-size="7.5">官方语义一次性; ENOBUFS retainControls 保证到达</text>
+        <!-- A4 -->
+        <rect x="60" y="628" width="360" height="56" rx="6" fill="rgba(30,41,59,0.6)" stroke="#fbbf24" stroke-width="1"/>
+        <text x="70" y="646" fill="#fbbf24" font-size="8.5" font-weight="600">A4 · IPA: LensPosition 只在 manual 生效</text>
+        <text x="70" y="662" fill="#94a3b8" font-size="7.5">VCM 移动到目标位置, 无自动扫描</text>
+        <text x="70" y="676" fill="#64748b" font-size="7">停止条件: 用户勾选 focus_auto=1 → 走 B 路径</text>
+
+        <!-- A 箭头 -->
+        <line x1="240" y1="460" x2="240" y2="514" stroke="#fbbf24" stroke-width="1" marker-end="url(#arrowhead)"/>
+        <line x1="240" y1="560" x2="240" y2="570" stroke="#fbbf24" stroke-width="1" marker-end="url(#arrowhead)"/>
+        <line x1="240" y1="616" x2="240" y2="626" stroke="#fbbf24" stroke-width="1" marker-end="url(#arrowhead)"/>
+
+        <!-- ─── 路径 B: AUTO ─── -->
+        <!-- B1 -->
+        <rect x="490" y="460" width="360" height="56" rx="6" fill="rgba(8,51,68,0.6)" stroke="#22d3ee" stroke-width="1"/>
+        <text x="500" y="478" fill="#22d3ee" font-size="8.5" font-weight="600">B1 · 触发源 (二选一)</text>
+        <text x="500" y="494" fill="#94a3b8" font-size="7.5">① af_trigger 0→1 边沿 (点触发)  [trig_event]</text>
+        <text x="500" y="508" fill="#94a3b8" font-size="7.5">② focus_auto 0→1 边沿 (勾选)  [auto_on_event]</text>
+        <!-- B2 -->
+        <rect x="490" y="528" width="360" height="44" rx="6" fill="rgba(8,51,68,0.6)" stroke="#22d3ee" stroke-width="1"/>
+        <text x="500" y="546" fill="#22d3ee" font-size="8.5" font-weight="600">B2 · router: af_apply_mode(1) + af_apply_trigger()</text>
+        <text x="500" y="562" fill="#94a3b8" font-size="7.5">发 af-mode=1 + af-trigger=Start (异步 g_object_set)</text>
+        <!-- B3 -->
+        <rect x="490" y="584" width="360" height="44" rx="6" fill="rgba(8,51,68,0.6)" stroke="#22d3ee" stroke-width="1"/>
+        <text x="500" y="602" fill="#22d3ee" font-size="8.5" font-weight="600">B3 · ENOBUFS retainControls 保证到达</text>
+        <text x="500" y="618" fill="#94a3b8" font-size="7.5">buffer 池不足丢弃时控件放回 controls_ (无重发)</text>
+        <!-- B4 -->
+        <rect x="490" y="640" width="360" height="56" rx="6" fill="rgba(8,51,68,0.6)" stroke="#22d3ee" stroke-width="1"/>
+        <text x="500" y="658" fill="#22d3ee" font-size="8.5" font-weight="600">B4 · (仅 trig_event) 延迟 300ms 写回 af_trigger=0</text>
+        <text x="500" y="674" fill="#94a3b8" font-size="7.5">保持"待触发"状态 (复位仅 focus_auto=0 时)</text>
+        <text x="500" y="688" fill="#64748b" font-size="7">continuous 下设 1 被忽略 → 立即复位 0 (防残留)</text>
+        <!-- B5 -->
+        <rect x="490" y="708" width="360" height="56" rx="6" fill="rgba(8,51,68,0.6)" stroke="#22d3ee" stroke-width="1"/>
+        <text x="500" y="726" fill="#22d3ee" font-size="8.5" font-weight="600">B5 · IPA: AfTriggerStart → 全范围扫描链</text>
+        <text x="500" y="742" fill="#94a3b8" font-size="7.5">粗扫 (最多 2 次) → 峰值确认 → 细扫 → 锁定</text>
+        <text x="500" y="756" fill="#64748b" font-size="7">扫描中忽略 abs (af_scanning); 完成输出 AfState=Focused</text>
+
+        <!-- B 箭头 -->
+        <line x1="670" y1="516" x2="670" y2="526" stroke="#22d3ee" stroke-width="1" marker-end="url(#arrowhead-cyan)"/>
+        <line x1="670" y1="572" x2="670" y2="582" stroke="#22d3ee" stroke-width="1" marker-end="url(#arrowhead-cyan)"/>
+        <line x1="670" y1="628" x2="670" y2="638" stroke="#22d3ee" stroke-width="1" marker-end="url(#arrowhead-cyan)"/>
+        <line x1="670" y1="696" x2="670" y2="706" stroke="#22d3ee" stroke-width="1" marker-end="url(#arrowhead-cyan)"/>
+
+        <!-- ─── 路径 C: CONTINUOUS ─── -->
+        <rect x="920" y="460" width="400" height="44" rx="6" fill="rgba(76,29,149,0.4)" stroke="#a78bfa" stroke-width="1"/>
+        <text x="930" y="478" fill="#a78bfa" font-size="8.5" font-weight="600">C1 · 默认模式 (开机即 continuous)</text>
+        <text x="930" y="494" fill="#94a3b8" font-size="7.5">稳定后失焦检测 → 全范围重扫 (同 auto 链)</text>
+
+        <rect x="920" y="516" width="400" height="44" rx="6" fill="rgba(76,29,149,0.4)" stroke="#a78bfa" stroke-width="1"/>
+        <text x="930" y="534" fill="#a78bfa" font-size="8.5" font-weight="600">C2 · continuous 一次性设置 (无心跳)</text>
+        <text x="930" y="550" fill="#94a3b8" font-size="7.5">官方语义; ENOBUFS retainControls 保证到达</text>
+
+        <rect x="920" y="572" width="400" height="44" rx="6" fill="rgba(76,29,149,0.4)" stroke="#a78bfa" stroke-width="1"/>
+        <text x="930" y="590" fill="#a78bfa" font-size="8.5" font-weight="600">C3 · 手动→continuous: 先判失焦再重扫</text>
+        <text x="930" y="606" fill="#94a3b8" font-size="7.5">stable 继承 → 失焦连续 5 帧超阈值才启动扫描</text>
+
+        <!-- ⚠ 核心机制标注 -->
+        <rect x="920" y="640" width="400" height="90" rx="8" fill="rgba(136,19,55,0.15)" stroke="#fb7185" stroke-width="1.2" stroke-dasharray="4,3"/>
+        <text x="940" y="662" fill="#fb7185" font-size="9.5" font-weight="700">⚠ 真根因: ENOBUFS 丢 request (非竞态)</text>
+        <text x="940" y="680" fill="#fda4af" font-size="8">gst buffer 池不足 → acquire_buffer 失败</text>
+        <text x="940" y="695" fill="#fda4af" font-size="8">→ 带控件 request 整体丢弃 → 控件消失</text>
+        <text x="940" y="710" fill="#fda4af" font-size="8">retainControls 放回 controls_ → 下次带上</text>
+        <text x="940" y="725" fill="#fda4af" font-size="8">(竞态锁/逐个 set 均无效 — 断点不在此)</text>
+
+        <rect x="920" y="750" width="400" height="90" rx="8" fill="rgba(34,211,238,0.06)" stroke="#0e7490" stroke-width="1" stroke-dasharray="4,3"/>
+        <text x="940" y="772" fill="#67e8f9" font-size="9.5" font-weight="700">✓ 2026-08-10 修复链 (完成检测)</text>
+        <text x="940" y="790" fill="#a5f3fc" font-size="8">1. retainControls: ENOBUFS 控件不丢 (9ad5814)</text>
+        <text x="940" y="805" fill="#a5f3fc" font-size="8">2. af_scanning: 扫描中忽略 abs (577be69)</text>
+        <text x="940" y="820" fill="#a5f3fc" font-size="8">3. AfState 200ms 轮询 → 完成即回 manual (d7d72d0)</text>
+        <text x="940" y="835" fill="#a5f3fc" font-size="8">   30s 兜底 timer, 完成时取消 (2333da7)</text>
+
+        <!-- A→B 转换箭头 -->
+        <path d="M 420 700 L 470 700" fill="none" stroke="#22d3ee" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#arrowhead-cyan)"/>
+        <text x="445" y="692" fill="#7dd3fc" font-size="7" text-anchor="middle">勾选auto</text>
+        <!-- B→C 转换箭头 -->
+        <path d="M 852 700 L 898 700" fill="none" stroke="#a78bfa" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#arrowhead-violet)"/>
+        <text x="875" y="692" fill="#c4b5fd" font-size="7" text-anchor="middle">切continuous</text>
+
+        <!-- ══════════════════════════════════════════════════════════════
+             SECTION 3: 时间线层 (Timeline) — 自动触发一次完整生命周期
+             ══════════════════════════════════════════════════════════════ -->
+        <rect x="20" y="950" width="1340" height="560" rx="12" fill="rgba(167,139,250,0.05)" stroke="#4c1d95" stroke-width="1" stroke-dasharray="8,4"/>
+        <text x="40" y="978" fill="#a78bfa" font-size="13" font-weight="700">③ 时间线层 TIMELINE — af_trigger=1 一次触发完整生命周期 (对数时间轴)</text>
+
+        <!-- 时间轴 -->
+        <line x1="80" y1="1060" x2="1320" y2="1060" stroke="#475569" stroke-width="2"/>
+        <line x1="80" y1="1052" x2="80" y2="1068" stroke="#475569" stroke-width="2"/>
+        <line x1="1320" y1="1052" x2="1320" y2="1068" stroke="#475569" stroke-width="2"/>
+
+        <!-- 时间刻度 (对数) -->
+        <text x="80" y="1084" fill="#64748b" font-size="8" text-anchor="middle">t=0</text>
+        <text x="240" y="1084" fill="#64748b" font-size="8" text-anchor="middle">300ms</text>
+        <text x="420" y="1084" fill="#64748b" font-size="8" text-anchor="middle">500ms</text>
+        <text x="580" y="1084" fill="#64748b" font-size="8" text-anchor="middle">1s</text>
+        <text x="760" y="1084" fill="#64748b" font-size="8" text-anchor="middle">1.5s</text>
+        <text x="930" y="1084" fill="#64748b" font-size="8" text-anchor="middle">2s+</text>
+        <text x="1160" y="1084" fill="#64748b" font-size="8" text-anchor="middle">~13s (粗扫×2+精扫)</text>
+        <text x="1290" y="1084" fill="#64748b" font-size="8" text-anchor="middle">AfState完成</text>
+
+        <!-- 事件块 (时间线上方, 每行一个角色泳道) -->
+
+        <!-- 泳道: 用户/应用 -->
+        <text x="80" y="1020" fill="#94a3b8" font-size="8.5" font-weight="600">用户/应用</text>
+        <rect x="80" y="1005" width="120" height="18" rx="4" fill="rgba(30,41,59,0.7)" stroke="#94a3b8" stroke-width="1"/>
+        <text x="140" y="1017" fill="#e2e8f0" font-size="7.5" text-anchor="middle">写 af_trigger=1</text>
+
+        <!-- 泳道: router 轮询 -->
+        <text x="80" y="1050" fill="#94a3b8" font-size="8.5" font-weight="600">router 轮询</text>
+        <rect x="80" y="1035" width="90" height="18" rx="4" fill="rgba(6,78,59,0.7)" stroke="#34d399" stroke-width="1"/>
+        <text x="125" y="1047" fill="#d1fae5" font-size="7.5" text-anchor="middle">检测 0→1 边沿</text>
+
+        <!-- 泳道: router 发送 -->
+        <text x="80" y="1120" fill="#94a3b8" font-size="8.5" font-weight="600">router 发送</text>
+        <rect x="80" y="1105" width="200" height="18" rx="4" fill="rgba(6,78,59,0.7)" stroke="#34d399" stroke-width="1"/>
+        <text x="180" y="1117" fill="#d1fae5" font-size="7.5" text-anchor="middle">af-mode=1 + Start (一次)</text>
+        <rect x="580" y="1105" width="200" height="18" rx="4" fill="rgba(6,78,59,0.5)" stroke="#34d399" stroke-width="1"/>
+        <text x="680" y="1117" fill="#a7f3d0" font-size="7.5" text-anchor="middle">ENOBUFS retainControls 保证到达</text>
+
+        <!-- 泳道: 复位 -->
+        <text x="80" y="1155" fill="#94a3b8" font-size="8.5" font-weight="600">af_trigger 复位</text>
+        <rect x="240" y="1140" width="150" height="18" rx="4" fill="rgba(136,19,55,0.5)" stroke="#fb7185" stroke-width="1"/>
+        <text x="315" y="1152" fill="#fecdd3" font-size="7.5" text-anchor="middle">延迟 300ms 写回 0</text>
+        <text x="470" y="1158" fill="#fda4af" font-size="7">(保持待触发状态)</text>
+
+        <!-- 泳道: IPA -->
+        <text x="80" y="1195" fill="#94a3b8" font-size="8.5" font-weight="600">IPA 扫描</text>
+        <rect x="420" y="1180" width="170" height="18" rx="4" fill="rgba(76,29,149,0.6)" stroke="#a78bfa" stroke-width="1"/>
+        <text x="505" y="1192" fill="#ddd6fe" font-size="7.5" text-anchor="middle">粗扫 #1 (全范围)</text>
+        <rect x="720" y="1180" width="130" height="18" rx="4" fill="rgba(76,29,149,0.6)" stroke="#a78bfa" stroke-width="1"/>
+        <text x="785" y="1192" fill="#ddd6fe" font-size="7.5" text-anchor="middle">峰值确认</text>
+        <rect x="980" y="1180" width="110" height="18" rx="4" fill="rgba(76,29,149,0.6)" stroke="#a78bfa" stroke-width="1"/>
+        <text x="1035" y="1192" fill="#ddd6fe" font-size="7.5" text-anchor="middle">细扫 → 锁定</text>
+        <rect x="1160" y="1180" width="110" height="18" rx="4" fill="rgba(76,29,149,0.5)" stroke="#a78bfa" stroke-width="1"/>
+        <text x="1215" y="1192" fill="#ddd6fe" font-size="7.5" text-anchor="middle">AfState=Focused</text>
+
+        <!-- 泳道: 完成检测 -->
+        <text x="80" y="1235" fill="#94a3b8" font-size="8.5" font-weight="600">完成检测</text>
+        <rect x="1160" y="1220" width="150" height="18" rx="4" fill="rgba(251,146,60,0.4)" stroke="#fb923c" stroke-width="1"/>
+        <text x="1235" y="1232" fill="#fed7aa" font-size="7.5" text-anchor="middle">router 200ms 轮询 → 回 manual</text>
+
+        <!-- 泳道: 主循环 ENOBUFS 窗口 -->
+        <text x="80" y="1275" fill="#94a3b8" font-size="8.5" font-weight="600">每帧 ENOBUFS</text>
+        <rect x="80" y="1260" width="1240" height="14" rx="3" fill="rgba(136,19,55,0.08)" stroke="#fb7185" stroke-width="0.8" stroke-dasharray="3,3"/>
+        <text x="700" y="1271" fill="#fda4af" font-size="7.5" text-anchor="middle">buffer 池不足 → request 丢弃 → retainControls 控件放回 controls_ (下一次 request 自动带上)</text>
+
+        <!-- 时间线箭头连接: 检测 → 发送 -->
+        <line x1="170" y1="1053" x2="170" y2="1103" stroke="#34d399" stroke-width="1" marker-end="url(#arrowhead-emerald)"/>
+        <!-- 发送 → IPA 粗扫 -->
+        <line x1="480" y1="1123" x2="490" y2="1178" stroke="#a78bfa" stroke-width="0.8" stroke-dasharray="3,3"/>
+        <!-- IPA 粗扫 → 峰值确认 -->
+        <line x1="590" y1="1198" x2="718" y2="1198" stroke="#a78bfa" stroke-width="0.8" stroke-dasharray="3,3"/>
+        <!-- IPA 峰值确认 → 细扫 -->
+        <line x1="850" y1="1198" x2="978" y2="1198" stroke="#a78bfa" stroke-width="0.8" stroke-dasharray="3,3"/>
+        <!-- 细扫 → 完成检测 -->
+        <line x1="1090" y1="1198" x2="1200" y2="1218" stroke="#fb923c" stroke-width="0.8" stroke-dasharray="3,3"/>
+        <text x="1180" y="1212" fill="#fdba74" font-size="7" text-anchor="middle">AfState 检测</text>
+
+        <!-- 图例 -->
+        <rect x="80" y="1320" width="1240" height="60" rx="8" fill="rgba(15,23,42,0.7)" stroke="#1e293b" stroke-width="1"/>
+        <text x="100" y="1340" fill="white" font-size="10" font-weight="600">图例</text>
+        <rect x="100" y="1350" width="14" height="9" rx="2" fill="rgba(30,41,59,0.5)" stroke="#94a3b8" stroke-width="1"/>
+        <text x="120" y="1358" fill="#94a3b8" font-size="7.5">外部/应用</text>
+        <rect x="200" y="1350" width="14" height="9" rx="2" fill="rgba(8,51,68,0.4)" stroke="#22d3ee" stroke-width="1"/>
+        <text x="220" y="1358" fill="#94a3b8" font-size="7.5">v4l2 控件面</text>
+        <rect x="310" y="1350" width="14" height="9" rx="2" fill="rgba(6,78,59,0.4)" stroke="#34d399" stroke-width="1"/>
+        <text x="330" y="1358" fill="#94a3b8" font-size="7.5">router/libcamerasrc</text>
+        <rect x="470" y="1350" width="14" height="9" rx="2" fill="rgba(251,146,60,0.3)" stroke="#fb923c" stroke-width="1"/>
+        <text x="490" y="1358" fill="#94a3b8" font-size="7.5">libcamera 管线</text>
+        <rect x="590" y="1350" width="14" height="9" rx="2" fill="rgba(76,29,149,0.4)" stroke="#a78bfa" stroke-width="1"/>
+        <text x="610" y="1358" fill="#94a3b8" font-size="7.5">IPA</text>
+        <rect x="660" y="1350" width="14" height="9" rx="2" fill="rgba(136,19,55,0.4)" stroke="#fb7185" stroke-width="1"/>
+        <text x="680" y="1358" fill="#94a3b8" font-size="7.5">竞态/复位</text>
+        <line x1="760" y1="1354" x2="780" y2="1354" stroke="#fbbf24" stroke-width="1.2" stroke-dasharray="5,3"/>
+        <text x="786" y="1358" fill="#94a3b8" font-size="7.5">模式转换</text>
+        <line x1="870" y1="1354" x2="890" y2="1354" stroke="#64748b" stroke-width="1.2" stroke-dasharray="3,3"/>
+        <text x="896" y="1358" fill="#94a3b8" font-size="7.5">跨线程/异步</text>
+        <text x="1000" y="1358" fill="#64748b" font-size="7.5" text-anchor="middle">数据来源: ov5670-router.c (2026-08-10) + af.cpp + gstlibcamerasrc</text>
+      </svg>
+    </div>
+
+    <!-- 信息卡 -->
+    <div class="cards">
+      <div class="card">
+        <div class="card-header"><div class="card-dot rose"></div><h3>关键修复 (2026-08-10)</h3></div>
+        <ul>
+          <li>• ENOBUFS 丢控件根因: <code>retainControls</code> 放回控件 (9ad5814)</li>
+          <li>• Start 兜底重发移除 — 二次触发扫描重启 (93d3721)</li>
+          <li>• af_scanning: 扫描中忽略手动移镜 (577be69)</li>
+          <li>• AfState 官方完成检测替代定时回退 (d7d72d0)</li>
+          <li>• 粗扫 2 次 (kMaxRescan=1) + 完成时取消兜底 timer (5f3eb3c/2333da7)</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="card-header"><div class="card-dot amber"></div><h3>模式转换规则</h3></div>
+        <ul>
+          <li>• manual → auto: 勾选 focus_auto (0→1 边沿)</li>
+          <li>• auto → manual: AfState 完成检测 (200ms 轮询) 自动回</li>
+          <li>• manual → continuous: stable 继承, 先判失焦再重扫</li>
+          <li>• continuous: 默认模式, 失焦连续 5 帧才重扫</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="card-header"><div class="card-dot violet"></div><h3>触发语义</h3></div>
+        <ul>
+          <li>• af_trigger 是 int 控件非 button — 写 1 保持 1</li>
+          <li>• router 消费边沿后写回 0 → 下次 0→1 可再触发</li>
+          <li>• continuous 下触发被忽略 → 立即复位 0 (防残留)</li>
+          <li>• 触发后 300ms 复位 + 无重发 (ENOBUFS 已根治)</li>
+        </ul>
+      </div>
+    </div>
+
+    <p class="footer">
+      Lenovo MIIX 720 OV5670 后摄对焦链 • ov5670-router.c + libcamerasrc (P3) + IPA IPU3Af • 提交 d7d72d0 (AfState 完成检测) • 2026-08-10
+    </p>
+  </div>
+</body>
+</html>

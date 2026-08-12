@@ -1,0 +1,4 @@
+# OV5670 Virtual Camera - load loopback module at boot
+# (module options live in /etc/modprobe.d/ov5670-virtual-camera.conf;
+#  modules-load.d 只写模块名, options 行会被 systemd 忽略)
+v4l2loopback
